@@ -113,15 +113,168 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function forwardWriteCell(message) {
   const tabId = resolveWriteTabId(message);
   if (typeof tabId !== "number") return { ok: false, reason: "NO_FEISHU_TAB" };
-  const injected = await ensureContentScript(tabId);
+  const target = message && message.targetSnapshot && typeof message.targetSnapshot === "object"
+    ? message.targetSnapshot
+    : {};
+  const activation = await activateSourceTab(tabId, target);
+  if (!activation.ok) return activation;
+
+  const injected = await ensureContentScript(tabId, { force: Boolean(activation.navigated) });
   if (!injected) return { ok: false, reason: "CONTENT_SCRIPT_NOT_READY" };
-  const frameId = resolveWriteFrameId(tabId, message);
+  const discoveredFrameId = await discoverWriteFrameId(tabId, target);
+  const frameId = typeof discoveredFrameId === "number"
+    ? discoveredFrameId
+    : resolveWriteFrameId(tabId, message);
   const options = typeof frameId === "number" ? { frameId } : undefined;
   try {
-    return await chrome.tabs.sendMessage(tabId, message, options);
+    const response = await chrome.tabs.sendMessage(tabId, {
+      ...message,
+      sourceTabActivated: true,
+      sourceTabUrl: activation.tabUrl || ""
+    }, options);
+    return response;
   } catch (error) {
     return { ok: false, reason: error && error.message ? error.message : "WRITE_MESSAGE_FAILED" };
   }
+}
+
+async function activateSourceTab(tabId, target) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (_) {
+    return { ok: false, reason: "SOURCE_TAB_UNAVAILABLE" };
+  }
+  if (!tab || typeof tab.id !== "number") {
+    return { ok: false, reason: "SOURCE_TAB_UNAVAILABLE" };
+  }
+
+  const expectedTabUrl = String(target && target.tabUrl || "");
+  if (expectedTabUrl && tab.url && !isSameSourceDocument(tab.url, expectedTabUrl)) {
+    return { ok: false, reason: "SOURCE_TAB_NAVIGATED" };
+  }
+
+  try {
+    const windowId = tab.windowId;
+    if (typeof windowId === "number" && chrome.windows && chrome.windows.update) {
+      await chrome.windows.update(windowId, { focused: true });
+    }
+    tab = await chrome.tabs.update(tabId, { active: true });
+  } catch (_) {
+    return { ok: false, reason: "SOURCE_TAB_UNAVAILABLE" };
+  }
+
+  const targetSheetId = String(target && target.sheetId || "");
+  const currentSheetId = getSheetIdFromUrl(tab && tab.url);
+  const targetTabSheetId = getSheetIdFromUrl(expectedTabUrl);
+  const shouldNavigateSheet = Boolean(
+    expectedTabUrl &&
+    targetSheetId &&
+    targetTabSheetId &&
+    currentSheetId !== targetSheetId &&
+    targetTabSheetId === targetSheetId
+  );
+
+  if (shouldNavigateSheet) {
+    try {
+      await chrome.tabs.update(tabId, { url: expectedTabUrl, active: true });
+      tab = await waitForTabReady(tabId, 12000);
+    } catch (_) {
+      return { ok: false, reason: "SOURCE_SHEET_UNAVAILABLE" };
+    }
+  }
+
+  await delay(90);
+  return {
+    ok: true,
+    navigated: shouldNavigateSheet,
+    tabUrl: tab && tab.url ? tab.url : ""
+  };
+}
+
+async function discoverWriteFrameId(tabId, target) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => ({
+        installed: Boolean(window.__fzCellPreviewListenerInstalled),
+        url: location.href,
+        hasSheetCanvas: Boolean(document.querySelector("canvas.faster-single-canvas")),
+        hasFormulaControl: Boolean(document.querySelector(
+          "[data-testid*='formula' i],[class*='formula' i],[aria-label*='公式' i],[placeholder*='公式' i]"
+        ))
+      })
+    });
+    const targetPageUrl = String(target && target.pageUrl || "");
+    const scored = (results || [])
+      .filter((item) => item && item.result && item.result.installed)
+      .map((item) => {
+        let score = 0;
+        if (item.result.hasSheetCanvas) score += 50;
+        if (item.result.hasFormulaControl) score += 20;
+        if (targetPageUrl && item.result.url === targetPageUrl) score += 40;
+        if (typeof item.frameId === "number" && item.frameId === toFiniteNumber(target && target.frameId)) score += 10;
+        return { frameId: item.frameId, score };
+      })
+      .sort((a, b) => b.score - a.score);
+    return scored.length && scored[0].score > 0 ? scored[0].frameId : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function isSameSourceDocument(currentUrl, expectedUrl) {
+  const currentKey = getSourceDocumentKey(currentUrl);
+  const expectedKey = getSourceDocumentKey(expectedUrl);
+  return Boolean(currentKey && expectedKey && currentKey === expectedKey);
+}
+
+function getSourceDocumentKey(value) {
+  try {
+    const url = new URL(String(value || ""));
+    const path = url.pathname.replace(/\/+$/, "");
+    return `${url.origin.toLowerCase()}${path}`;
+  } catch (_) {
+    return "";
+  }
+}
+
+function getSheetIdFromUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return String(url.searchParams.get("sheet") || url.searchParams.get("sheetId") || "");
+  } catch (_) {
+    return "";
+  }
+}
+
+function waitForTabReady(tabId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const finish = (error, tab) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      if (error) reject(error);
+      else resolve(tab);
+    };
+    const listener = (updatedTabId, changeInfo, tab) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === "complete") finish(null, tab);
+    };
+    const timer = setTimeout(() => {
+      chrome.tabs.get(tabId).then((tab) => finish(null, tab)).catch((error) => finish(error));
+    }, timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab && tab.status === "complete") finish(null, tab);
+    }).catch((error) => finish(error));
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function rememberFeishuTab(tab) {
@@ -171,7 +324,8 @@ function relayToPanels(message, sender) {
     fzRouted: true,
     tabId: tab.id,
     windowId: typeof tab.windowId === "number" ? tab.windowId : null,
-    frameId: typeof sender.frameId === "number" ? sender.frameId : null
+    frameId: typeof sender.frameId === "number" ? sender.frameId : null,
+    tabUrl: tab.url || ""
   };
   const result = chrome.runtime.sendMessage(routed);
   if (result && typeof result.catch === "function") result.catch(() => {});

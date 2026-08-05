@@ -12,6 +12,11 @@
   const KEYBOARD_CAPTURE_DELAY_MS = 80;
   const FORMULA_CAPTURE_MIN_ACCEPT_MS = 200;
   const FORMULA_SAME_TEXT_SETTLE_MS = 650;
+  const AUTO_EMPTY_CAPTURE_MIN_STABLE_MS = 200;
+  const AUTO_EMPTY_CAPTURE_REQUIRED_HITS = 3;
+  const TARGET_NAVIGATION_CHECKPOINT_DELAYS_MS = [50, 70, 120, 210, 400];
+  const TARGET_NAVIGATION_MIN_STABLE_MS = 240;
+  const MAX_TARGET_SCAN_CANDIDATES = 36;
 
   const CELL_SELECTOR = "[role='gridcell'], [data-cell], [data-cell-id], td, th";
   const EDITOR_SELECTOR = "[contenteditable]:not([contenteditable='false']),textarea,input[type='text'],input:not([type]),[role='textbox']";
@@ -50,6 +55,7 @@
   let currentSession = null;
   let lastCellContext = null;
   let lastCaptureResult = null;
+  const trustedCaptureResults = new Map();
   let keyboardCaptureTimer = 0;
 
   document.addEventListener("click", (event) => {
@@ -57,7 +63,10 @@
       if (!event.isTrusted || !(event.target instanceof Element)) return;
       const context = normalizeCellContext({ x: event.clientX, y: event.clientY });
       if (context) lastCellContext = context;
-      startCaptureSession(event.target, event, context);
+      startCaptureSession(event.target, event, context, {
+        allowStableEmpty: true,
+        captureOrigin: "user_selection"
+      });
     } catch (error) {
       emitCaptureError(error, event && event.target instanceof Element ? event.target : null);
     }
@@ -95,10 +104,16 @@
       startedMs: performance.now(),
       clickTarget: describeClickTarget(target, event),
       clickContext: context || null,
-      cellAddress: resolveCellAddress(target, context),
+      cellAddress: normalizeCellAddress(options && options.initialCellAddress) || resolveCellAddress(target, context),
+      addressEvidenceLocked: Boolean(options && options.requireStableAddressEvidence) || Boolean(normalizeCellAddress(options && options.initialCellAddress)),
+      addressEvidenceHits: normalizeCellAddress(options && options.initialCellAddress) ? 1 : 0,
       attempts: [],
       emptyLikelyHits: 0,
+      stableEmptyHits: 0,
+      stableEmptyAddress: "",
       suppressEmpty: Boolean(options && options.suppressEmpty),
+      allowStableEmpty: Boolean(options && options.allowStableEmpty),
+      captureOrigin: String(options && options.captureOrigin || (event && event.isTrusted ? "user_selection" : "unspecified")),
       state: "running"
     };
     currentSession = session;
@@ -109,20 +124,29 @@
 
     window.setTimeout(() => {
       if (!isSessionActive(session)) return;
+      if (canEmitStableEmptyCapture(session)) {
+        emitStableEmptyCapture(session, "当前空单元格");
+        return;
+      }
       if (session.sawStalePreviousFormula) {
         finalizeSession(session, "success", "公式栏同步未完成");
         return;
       }
-      if (!session.suppressEmpty) {
+      if (!session.suppressEmpty && !session.allowStableEmpty) {
         emitCellSelected("", "空单元格", session.clickContext, session.cellAddress);
       }
-      finalizeSession(session, "success", session.suppressEmpty ? "自动读取未命中" : "空单元格");
+      const timeoutReason = session.allowStableEmpty
+        ? "空单元格证据不足"
+        : (session.suppressEmpty ? "自动读取未命中" : "空单元格");
+      finalizeSession(session, "success", timeoutReason);
     }, CAPTURE_TIMEOUT_MS);
   }
 
   function runCaptureAttempt(session, target, stepIndex) {
     if (!isSessionActive(session)) return;
-    if (!session.cellAddress || stepIndex <= 2) {
+    if (session.addressEvidenceLocked) {
+      updateLockedCaptureAddressEvidence(session, readVisibleCellAddressEvidence(session.clickContext));
+    } else if (!session.cellAddress || stepIndex <= 2) {
       const freshAddress = resolveCellAddress(target, session.clickContext);
       if (freshAddress) session.cellAddress = freshAddress;
     }
@@ -132,6 +156,7 @@
     ];
 
     let stepFormulaEmpty = false;
+    let stepFormulaConfirmedEmpty = false;
 
     for (const probe of probes) {
       const raw = safelyRunProbe(probe.run);
@@ -157,14 +182,26 @@
       }
 
       if (probe.key === "formula" && ["cell_address_token", "empty", "not_useful"].includes(evaluation.reason)) stepFormulaEmpty = true;
+      if (probe.key === "formula" && evaluation.reason === "empty") {
+        const formulaEditor = findBestFormulaEditor();
+        stepFormulaConfirmedEmpty = Boolean(
+          formulaEditor instanceof Element &&
+          isVisibleElement(formulaEditor) &&
+          document.querySelector("canvas.faster-single-canvas")
+        );
+      }
 
       if (evaluation.status !== "success") continue;
+      if (!isCaptureAddressConfirmed(session)) continue;
 
-      rememberCaptureResult(text, session.cellAddress);
-      emitCellSelected(text, probe.source, session.clickContext, session.cellAddress);
+      const captureMeta = createCaptureSnapshotMeta(session);
+      rememberCaptureResult(text, session.cellAddress, captureMeta);
+      emitCellSelected(text, probe.source, session.clickContext, session.cellAddress, captureMeta);
       finalizeSession(session, "success", probe.source);
       return;
     }
+
+    updateStableEmptyCaptureEvidence(session, stepFormulaConfirmedEmpty);
 
     if (stepFormulaEmpty) {
       session.emptyLikelyHits += 1;
@@ -172,12 +209,93 @@
       session.emptyLikelyHits = 0;
     }
 
-    if (stepIndex >= EARLY_EMPTY_MIN_STEP_INDEX && session.emptyLikelyHits >= EARLY_EMPTY_REQUIRED_HITS) {
-      if (!session.suppressEmpty) {
-        emitCellSelected("", "空单元格", session.clickContext, session.cellAddress);
+    if (session.allowStableEmpty) {
+      if (canEmitStableEmptyCapture(session)) {
+        emitStableEmptyCapture(session, "当前空单元格");
       }
-      finalizeSession(session, "success", session.suppressEmpty ? "自动读取未命中" : "空单元格(快速)");
+      return;
     }
+
+    if (session.suppressEmpty) return;
+
+    if (stepIndex >= EARLY_EMPTY_MIN_STEP_INDEX && session.emptyLikelyHits >= EARLY_EMPTY_REQUIRED_HITS) {
+      emitCellSelected("", "空单元格", session.clickContext, session.cellAddress);
+      finalizeSession(session, "success", "空单元格(快速)");
+    }
+  }
+
+  function updateStableEmptyCaptureEvidence(session, confirmedEmpty) {
+    const address = normalizeCellAddress(session && session.cellAddress);
+    if (!session || !confirmedEmpty || !address) {
+      if (session) {
+        session.stableEmptyHits = 0;
+        session.stableEmptyAddress = "";
+      }
+      return;
+    }
+    if (session.stableEmptyAddress === address) {
+      session.stableEmptyHits += 1;
+    } else {
+      session.stableEmptyAddress = address;
+      session.stableEmptyHits = 1;
+    }
+  }
+
+  function updateLockedCaptureAddressEvidence(session, address) {
+    if (!session || !session.addressEvidenceLocked) return;
+    const normalizedAddress = normalizeCellAddress(address);
+    if (!normalizedAddress) return;
+    if (normalizedAddress === normalizeCellAddress(session.cellAddress)) {
+      session.addressEvidenceHits += 1;
+      return;
+    }
+    session.cellAddress = normalizedAddress;
+    session.addressEvidenceHits = 1;
+    session.stableEmptyHits = 0;
+    session.stableEmptyAddress = "";
+  }
+
+  function isCaptureAddressConfirmed(session) {
+    if (!session || !normalizeCellAddress(session.cellAddress)) return false;
+    return !session.addressEvidenceLocked || session.addressEvidenceHits >= 2;
+  }
+
+  function canEmitStableEmptyCapture(session) {
+    return Boolean(
+      session &&
+      session.allowStableEmpty &&
+      isCaptureAddressConfirmed(session) &&
+      normalizeCellAddress(session.stableEmptyAddress) &&
+      session.stableEmptyHits >= AUTO_EMPTY_CAPTURE_REQUIRED_HITS &&
+      elapsedMs(session) >= AUTO_EMPTY_CAPTURE_MIN_STABLE_MS
+    );
+  }
+
+  function emitStableEmptyCapture(session, source) {
+    if (!isSessionActive(session)) return;
+    const captureMeta = createCaptureSnapshotMeta(session);
+    rememberCaptureResult("", session.stableEmptyAddress, captureMeta);
+    emitCellSelected("", source, session.clickContext, session.stableEmptyAddress, captureMeta);
+    finalizeSession(session, "success", source);
+  }
+
+  function createCaptureSnapshotMeta(session) {
+    return {
+      selectionConfirmed: isCaptureAddressConfirmed(session),
+      captureOrigin: String(session && session.captureOrigin || "unspecified"),
+      capturedAt: Date.now()
+    };
+  }
+
+  function readVisibleCellAddressEvidence(context) {
+    const display = findCellAddressDisplay();
+    if (display instanceof Element) {
+      const exactAddress = collectAddressCandidateTexts(display)
+        .map((value) => normalizeExactCellAddress(value))
+        .find(Boolean);
+      if (exactAddress) return exactAddress;
+    }
+    return normalizeCellAddress(findCellAddressFromVisibleUi(context));
   }
 
   function captureCurrentActiveCell() {
@@ -185,7 +303,14 @@
       const focusTarget = resolveFocusedCellCaptureTarget();
       const target = focusTarget.target || document.body;
       const context = focusTarget.context || lastCellContext;
-      startCaptureSession(target, null, context, { suppressEmpty: true });
+      const visibleAddress = readVisibleCellAddressEvidence(context);
+      startCaptureSession(target, null, context, {
+        suppressEmpty: true,
+        allowStableEmpty: true,
+        captureOrigin: "active_selection_refresh",
+        initialCellAddress: visibleAddress,
+        requireStableAddressEvidence: true
+      });
     } catch (error) {
       emitCaptureError(error, document.body);
     }
@@ -194,7 +319,11 @@
   function captureKeyboardFocusedCell() {
     const focusTarget = resolveFocusedCellCaptureTarget();
     if (!focusTarget.context && !focusTarget.target) return;
-    startCaptureSession(focusTarget.target || document.body, null, focusTarget.context || lastCellContext, { suppressEmpty: false });
+    startCaptureSession(focusTarget.target || document.body, null, focusTarget.context || lastCellContext, {
+      suppressEmpty: false,
+      allowStableEmpty: true,
+      captureOrigin: "keyboard_selection"
+    });
   }
 
   function scheduleKeyboardFocusCapture() {
@@ -227,9 +356,12 @@
     }
 
     const active = getDeepActiveElement();
+    if (!(active instanceof Element) || active === document.body || active === document.documentElement) {
+      return { target: null, context: null };
+    }
     const editable = resolveEditableRoot(active);
-    const target = editable instanceof Element ? editable : (active instanceof Element ? active : null);
-    const context = target instanceof Element ? getElementCenterContext(target) : null;
+    const target = editable instanceof Element ? editable : active;
+    const context = getElementCenterContext(target);
     return { target, context };
   }
 
@@ -316,8 +448,184 @@
 
   async function writeCellFromPanelDetailed(message) {
     const text = normalizeWriteText(message && message.text);
-    const requestedContext = normalizeCellContext(message && message.cellContext);
+    const initialContext = normalizeCellContext(message && message.cellContext);
+    const debugSession = createWriteDebugSession(
+      message,
+      text,
+      initialContext,
+      initialContext,
+      { mode: "logical_target_pending" }
+    );
+    let step = 1;
+    const logicalTarget = await resolveLogicalWriteTarget(message);
+    if (!logicalTarget.ok) {
+      pushWriteAttempt(debugSession, {
+        step: step++,
+        stage: "logical_target_resolution",
+        source: "可信逻辑单元格定位",
+        hit: false,
+        reason: logicalTarget.reason || "TARGET_NOT_FOUND",
+        candidateText: logicalTarget.observedText || "",
+        details: logicalTarget
+      });
+      emitWriteDebugSession(debugSession, "error", logicalTarget.reason || "TARGET_NOT_FOUND");
+      return {
+        ok: false,
+        reason: logicalTarget.reason || "TARGET_NOT_FOUND",
+        targetResolution: logicalTarget,
+        debugSessionId: debugSession.id
+      };
+    }
+
+    const context = normalizeCellContext(logicalTarget.context);
+    const observation = logicalTarget.observation || {};
+    const targetResolution = {
+      mode: "verified_logical_selection",
+      context,
+      address: logicalTarget.address,
+      reason: logicalTarget.reason,
+      selectionVerified: Boolean(observation.selectionVerified),
+      navigationChecks: observation.checks || []
+    };
+    debugSession.writeRequest.resolvedContext = context;
+    debugSession.writeRequest.writeContext = context;
+    debugSession.writeRequest.targetResolution = targetResolution;
+
+    pushWriteAttempt(debugSession, {
+      step: step++,
+      stage: "logical_target_resolution",
+      source: "可信逻辑单元格定位",
+      hit: Boolean(observation.selectionVerified),
+      reason: logicalTarget.reason || "unknown",
+      candidateText: observation.text || "",
+      details: {
+        address: logicalTarget.address,
+        context,
+        addressEvidenceSource: observation.addressEvidenceSource || "",
+        observedAddress: observation.observedAddress || "",
+        stableHits: observation.stableHits || 0,
+        elapsedMs: observation.elapsedMs || 0,
+        checks: observation.checks || []
+      }
+    });
+
+    const frameValidation = validateWriteFrameForContext(context);
+    const formulaEditor = observation.formulaEditor instanceof Element
+      ? observation.formulaEditor
+      : findBestFormulaEditor();
+    const writeReady = Boolean(
+      observation.selectionVerified &&
+      frameValidation &&
+      frameValidation.ok &&
+      formulaEditor instanceof Element &&
+      isVisibleElement(formulaEditor)
+    );
+    pushWriteAttempt(debugSession, {
+      step: step++,
+      stage: "verified_selection_write_ready",
+      source: "当前选区与公式栏校验",
+      hit: writeReady,
+      reason: writeReady
+        ? "verified_selection_and_formula_reader_ready"
+        : (!observation.selectionVerified
+          ? "target_selection_unverified"
+          : (!(formulaEditor instanceof Element) ? "formula_editor_not_found" : "formula_editor_not_ready")),
+      candidateText: extractEditableText(formulaEditor),
+      details: {
+        frameValidation,
+        formulaEditor: describeElementForDebug(formulaEditor),
+        context
+      }
+    });
+
+    if (!observation.selectionVerified) {
+      emitWriteDebugSession(debugSession, "error", "TARGET_SELECTION_UNVERIFIED");
+      return {
+        ok: false,
+        reason: "TARGET_SELECTION_UNVERIFIED",
+        debugSessionId: debugSession.id,
+        targetResolution
+      };
+    }
+    if (!frameValidation || !frameValidation.ok) {
+      emitWriteDebugSession(debugSession, "error", "NON_SHEET_FRAME");
+      return { ok: false, reason: "NON_SHEET_FRAME", debugSessionId: debugSession.id };
+    }
+    if (!(formulaEditor instanceof Element) || !isVisibleElement(formulaEditor)) {
+      emitWriteDebugSession(debugSession, "error", "FORMULA_EDITOR_NOT_FOUND");
+      return { ok: false, reason: "FORMULA_EDITOR_NOT_FOUND", debugSessionId: debugSession.id };
+    }
+
+    const isClearingCell = isClearWriteText(text);
+    const writeDispatch = isClearingCell
+      ? await runVerifiedSelectionClearStrategy()
+      : await runVerifiedSelectionPasteStrategy(text, message);
+    pushWriteAttempt(debugSession, {
+      step: step++,
+      stage: isClearingCell ? "verified_selection_clear" : "verified_selection_paste",
+      source: isClearingCell ? "向已验证选区发送删除事件" : "向已验证选区发送粘贴事件",
+      hit: Boolean(writeDispatch && writeDispatch.ok),
+      reason: writeDispatch && writeDispatch.reason ? writeDispatch.reason : "unknown",
+      candidateText: writeDispatch && typeof writeDispatch.observedFormula === "string"
+        ? writeDispatch.observedFormula
+        : "",
+      details: writeDispatch
+    });
+
+    const verification = await verifyCurrentSelectionWrite(
+      logicalTarget.address,
+      text,
+      observation
+    );
+    const writePersisted = Boolean(
+      verification.ok &&
+      verification.selectionVerified &&
+      normalizeCellText(verification.text) === normalizeCellText(text)
+    );
+    pushWriteAttempt(debugSession, {
+      step: step++,
+      stage: "verified_selection_persisted",
+      source: "稳定读取当前选区并校验写回结果",
+      hit: writePersisted,
+      reason: writePersisted ? "target_formula_matches_draft" : (verification.reason || "write_not_persisted"),
+      candidateText: verification.text || "",
+      details: verification
+    });
+
+    if (!writePersisted) {
+      emitWriteDebugSession(debugSession, "error", "WRITE_NOT_PERSISTED");
+      return {
+        ok: false,
+        reason: "WRITE_NOT_PERSISTED",
+        debugSessionId: debugSession.id,
+        targetResolution: verification
+      };
+    }
+
+    const verifiedContext = normalizeCellContext(verification.context) || context;
+    logicalTarget.context = verifiedContext;
+    logicalTarget.observation = verification;
+    emitCellSelected(text, "可信选区粘贴写回", verifiedContext, logicalTarget.address);
+    emitWriteDebugSession(debugSession, "success", "verified_selection_paste_ok");
+    return buildSuccessfulWriteResponse(message, logicalTarget, {
+      debugSessionId: debugSession.id,
+      writeStrategy: isClearingCell ? "verified_selection_clear" : "verified_selection_paste"
+    });
+  }
+
+  async function writeCellFromPanelLegacyDetailed(message) {
+    const text = normalizeWriteText(message && message.text);
+    const logicalTarget = await resolveLogicalWriteTarget(message);
+    if (!logicalTarget.ok) {
+      return {
+        ok: false,
+        reason: logicalTarget.reason || "TARGET_NOT_FOUND",
+        targetResolution: logicalTarget
+      };
+    }
+    const requestedContext = normalizeCellContext(logicalTarget.context);
     const targetResolution = resolveWriteTargetContext(message, requestedContext);
+    targetResolution.logicalTarget = logicalTarget;
     const context = targetResolution.context;
     const debugSession = createWriteDebugSession(message, text, requestedContext, context, targetResolution);
     let step = 1;
@@ -442,7 +750,10 @@
           details: { source: "clear_cell" }
         });
         emitWriteDebugSession(debugSession, "success", "clear_ok");
-        return { ok: true, debugSessionId: debugSession.id, writeStrategy: "clear" };
+        return buildSuccessfulWriteResponse(message, logicalTarget, {
+          debugSessionId: debugSession.id,
+          writeStrategy: "clear"
+        });
       }
     }
 
@@ -482,7 +793,10 @@
           details: { source: "native_paste_writeback", nativeFirst: true }
         });
         emitWriteDebugSession(debugSession, "success", "native_paste_ok");
-        return { ok: true, debugSessionId: debugSession.id, writeStrategy: "native_paste_first" };
+        return buildSuccessfulWriteResponse(message, logicalTarget, {
+          debugSessionId: debugSession.id,
+          writeStrategy: "native_paste_first"
+        });
       }
 
       if (isNativePasteLikelyDispatched(preferredNativePasteResult)) {
@@ -497,12 +811,11 @@
           details: { source: "native_paste_pending_lark_sync", nativeFirst: true }
         });
         emitWriteDebugSession(debugSession, "success", "native_paste_dispatched_pending_lark_sync");
-        return {
-          ok: true,
+        return buildSuccessfulWriteResponse(message, logicalTarget, {
           debugSessionId: debugSession.id,
           writeStrategy: "native_paste_first_pending_lark_sync",
           pendingVerification: true
-        };
+        });
       }
 
     }
@@ -531,7 +844,10 @@
         details: { source: "粘贴写回" }
       });
       emitWriteDebugSession(debugSession, "success", "paste_ok");
-      return { ok: true, debugSessionId: debugSession.id, writeStrategy: "paste" };
+      return buildSuccessfulWriteResponse(message, logicalTarget, {
+        debugSessionId: debugSession.id,
+        writeStrategy: "paste"
+      });
     }
 
     }
@@ -614,12 +930,11 @@
         details: { source: "输入模式写回(等待飞书同步)" }
       });
       emitWriteDebugSession(debugSession, "success", "editor_commit_dispatched_pending_lark_sync");
-      return {
-        ok: true,
+      return buildSuccessfulWriteResponse(message, logicalTarget, {
         debugSessionId: debugSession.id,
         writeStrategy: "editor_commit_pending_lark_sync",
         pendingVerification: true
-      };
+      });
     }
 
     if (!verifyResult || !verifyResult.ok) {
@@ -639,7 +954,780 @@
     });
 
     emitWriteDebugSession(debugSession, "success", "ok");
-    return { ok: true, debugSessionId: debugSession.id };
+    return buildSuccessfulWriteResponse(message, logicalTarget, {
+      debugSessionId: debugSession.id
+    });
+  }
+
+  async function resolveLogicalWriteTarget(message) {
+    const target = normalizeIncomingTargetSnapshot(message);
+    if (!target.address) {
+      return { ok: false, reason: "TARGET_ADDRESS_UNAVAILABLE" };
+    }
+
+    const pageIdentity = readSpreadsheetPageIdentity();
+    if (target.spreadsheetToken && pageIdentity.spreadsheetToken &&
+      target.spreadsheetToken !== pageIdentity.spreadsheetToken) {
+      return { ok: false, reason: "SOURCE_SHEET_UNAVAILABLE" };
+    }
+    if (target.sheetId && pageIdentity.sheetId && target.sheetId !== pageIdentity.sheetId) {
+      return { ok: false, reason: "SOURCE_SHEET_UNAVAILABLE" };
+    }
+
+    const expectedText = normalizeCellText(
+      message && Object.prototype.hasOwnProperty.call(message, "expectedText")
+        ? message.expectedText
+        : target.text
+    );
+    const original = await navigateAndObserveCell(target.address, expectedText);
+    if (!original.ok) {
+      return {
+        ok: false,
+        reason: "TARGET_NOT_FOUND",
+        address: target.address,
+        details: original
+      };
+    }
+
+    const fingerprintThreshold = getFingerprintMatchThreshold(target.fingerprint);
+    const originalFingerprintScore = scoreTargetFingerprint(target.fingerprint, original.fingerprint);
+    const originalTextMatches = normalizeCellText(original.text) === expectedText;
+    if (originalTextMatches) {
+      return {
+        ok: true,
+        reason: "original_address_verified",
+        address: original.address || target.address,
+        context: original.context,
+        observation: original,
+        target
+      };
+    }
+
+    if (fingerprintThreshold === 0) {
+      return {
+        ok: false,
+        reason: "WRITE_CONFLICT",
+        address: target.address,
+        observedText: original.text
+      };
+    }
+
+    const nearbyAddresses = buildNearbyCellAddresses(target.address, MAX_TARGET_SCAN_CANDIDATES);
+    const matches = [];
+    for (const address of nearbyAddresses) {
+      const observation = await navigateAndObserveCell(address, expectedText);
+      if (!observation.ok) continue;
+      if (normalizeCellText(observation.text) !== expectedText) continue;
+      matches.push({
+        ...observation,
+        fingerprintScore: scoreTargetFingerprint(target.fingerprint, observation.fingerprint)
+      });
+    }
+
+    if (matches.length === 1 && matches[0].fingerprintScore >= fingerprintThreshold) {
+      return {
+        ok: true,
+        reason: "logical_cell_moved_nearby",
+        address: matches[0].address,
+        context: matches[0].context,
+        observation: matches[0],
+        target
+      };
+    }
+
+    if (matches.length > 1) {
+      matches.sort((a, b) => b.fingerprintScore - a.fingerprintScore);
+      const best = matches[0];
+      const runnerUp = matches[1];
+      if (best.fingerprintScore >= fingerprintThreshold && best.fingerprintScore > runnerUp.fingerprintScore) {
+        return {
+          ok: true,
+          reason: "logical_cell_moved_fingerprint_match",
+          address: best.address,
+          context: best.context,
+          observation: best,
+          target
+        };
+      }
+      await navigateAndObserveCell(target.address, expectedText);
+      return {
+        ok: false,
+        reason: "TARGET_MISMATCH",
+        candidateCount: matches.length
+      };
+    }
+
+    await navigateAndObserveCell(target.address, expectedText);
+    if (originalFingerprintScore >= fingerprintThreshold && !originalTextMatches) {
+      return {
+        ok: false,
+        reason: "WRITE_CONFLICT",
+        address: target.address,
+        observedText: original.text
+      };
+    }
+    return {
+      ok: false,
+      reason: "TARGET_MISMATCH",
+      address: target.address
+    };
+  }
+
+  function normalizeIncomingTargetSnapshot(message) {
+    const raw = message && message.targetSnapshot && typeof message.targetSnapshot === "object"
+      ? message.targetSnapshot
+      : {};
+    return {
+      text: normalizeCellText(
+        Object.prototype.hasOwnProperty.call(raw, "text")
+          ? raw.text
+          : message && message.expectedText
+      ),
+      address: normalizeCellAddress(raw.address || message && message.cellAddress),
+      context: normalizeCellContext(raw.context || message && message.cellContext),
+      pageUrl: String(raw.pageUrl || ""),
+      sheetId: String(raw.sheetId || ""),
+      spreadsheetToken: String(raw.spreadsheetToken || ""),
+      tabId: Number.isFinite(Number(raw.tabId)) ? Number(raw.tabId) : null,
+      windowId: Number.isFinite(Number(raw.windowId)) ? Number(raw.windowId) : null,
+      frameId: Number.isFinite(Number(raw.frameId)) ? Number(raw.frameId) : null,
+      tabUrl: String(raw.tabUrl || ""),
+      fingerprint: normalizeIncomingFingerprint(raw.fingerprint),
+      selectionConfirmed: Boolean(raw.selectionConfirmed),
+      captureOrigin: String(raw.captureOrigin || "unspecified"),
+      capturedAt: Number(raw.capturedAt) || 0
+    };
+  }
+
+  function normalizeIncomingFingerprint(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    return {
+      text: normalizeCellText(raw.text),
+      address: normalizeCellAddress(raw.address),
+      neighbors: Array.isArray(raw.neighbors)
+        ? raw.neighbors.slice(0, 12).map((item) => ({
+          rowOffset: Number(item && item.rowOffset) || 0,
+          columnOffset: Number(item && item.columnOffset) || 0,
+          text: normalizeCellText(item && item.text)
+        }))
+        : []
+    };
+  }
+
+  function resolveAddressEvidence(requestedAddress, activeCellAddress, addressEcho) {
+    const requested = normalizeCellAddress(requestedAddress);
+    const active = normalizeCellAddress(activeCellAddress);
+    const echoed = normalizeCellAddress(addressEcho);
+    const activeMatches = Boolean(requested && active === requested);
+    const addressUiMatches = Boolean(requested && echoed === requested);
+    const conflict = Boolean(active && echoed && active !== echoed);
+    const verified = activeMatches || addressUiMatches;
+    return {
+      available: Boolean(active || echoed),
+      verified,
+      conflict,
+      activeMatches,
+      addressUiMatches,
+      observedAddress: activeMatches
+        ? active
+        : (addressUiMatches ? echoed : (active || echoed)),
+      source: activeMatches && addressUiMatches
+        ? "active_cell_attributes+address_ui"
+        : (activeMatches
+          ? "active_cell_attributes"
+          : (addressUiMatches ? "address_ui" : "none"))
+    };
+  }
+
+  async function verifyCurrentSelectionWrite(address, targetText, preWriteObservation) {
+    const normalizedAddress = normalizeCellAddress(address);
+    const normalizedTarget = normalizeCellText(targetText);
+    const waits = [50, 100, 200, 400];
+    const checks = [];
+    let stableHits = 0;
+    let latest = null;
+
+    for (let index = 0; index < waits.length; index += 1) {
+      const waitMs = waits[index];
+      await sleep(waitMs);
+
+      const activeCell = findCurrentActiveCellElement();
+      const activeCellAddress = normalizeCellAddress(extractCellAddressFromElement(activeCell));
+      const addressEcho = normalizeCellAddress(findCellAddressFromVisibleUi(null));
+      const addressEvidence = resolveAddressEvidence(normalizedAddress, activeCellAddress, addressEcho);
+      const observedAddress = addressEvidence.observedAddress;
+      const hasExplicitAddress = addressEvidence.available;
+      const addressConsistent = hasExplicitAddress
+        ? addressEvidence.verified
+        : Boolean(preWriteObservation && preWriteObservation.selectionVerified);
+      const formulaEditor = findBestFormulaEditor();
+      const observedFormula = normalizeCellText(formulaEditor ? extractEditableText(formulaEditor) : "");
+      const sheetCanvas = document.querySelector("canvas.faster-single-canvas");
+      const formulaMatches = observedFormula === normalizedTarget;
+      const matched = Boolean(
+        addressConsistent &&
+        formulaMatches &&
+        formulaEditor instanceof Element &&
+        isVisibleElement(formulaEditor) &&
+        sheetCanvas
+      );
+      stableHits = matched ? stableHits + 1 : 0;
+      const context = getElementCenterContext(activeCell) ||
+        findSelectionOverlayContext() ||
+        normalizeCellContext(preWriteObservation && preWriteObservation.context);
+
+      latest = {
+        ok: false,
+        reason: matched ? "write_observed_waiting_for_stability" : (
+          !addressConsistent ? "selected_address_changed_after_write" : "formula_not_matched_after_write"
+        ),
+        address: normalizedAddress,
+        observedAddress,
+        addressEvidenceSource: hasExplicitAddress
+          ? addressEvidence.source
+          : "prewrite_selection_continuity",
+        context,
+        text: observedFormula,
+        formulaEditor,
+        selectionVerified: addressConsistent,
+        stableHits
+      };
+      checks.push({
+        round: index + 1,
+        waitMs,
+        activeCellAddress,
+        addressEcho,
+        observedAddress,
+        addressConsistent,
+        addressEvidenceConflict: addressEvidence.conflict,
+        formulaMatches,
+        observedFormula,
+        stableHits,
+        addressControlTemporarilyUnavailable: !hasExplicitAddress,
+        activeElement: describeElementForDebug(getDeepActiveElement()),
+        formulaEditor: describeElementForDebug(formulaEditor),
+        sheetCanvas: describeElementForDebug(sheetCanvas)
+      });
+
+      if (stableHits >= 2) {
+        latest.ok = true;
+        latest.reason = "current_selection_formula_stably_matches_draft";
+        latest.checks = checks;
+        latest.fingerprint = buildTargetFingerprint(observedFormula, normalizedAddress);
+        return latest;
+      }
+    }
+
+    return {
+      ...(latest || {}),
+      ok: false,
+      reason: latest && latest.reason ? latest.reason : "write_verification_unavailable",
+      checks
+    };
+  }
+
+  async function observeCapturedSelectionContinuity(address, expectedText, navigationFailure) {
+    const normalizedAddress = normalizeCellAddress(address);
+    const normalizedExpected = normalizeCellText(expectedText);
+    const trustedCaptureResult = findTrustedCaptureResult(normalizedAddress);
+    const capturedAddress = normalizeCellAddress(trustedCaptureResult && trustedCaptureResult.cellAddress);
+    const capturedText = normalizeCellText(trustedCaptureResult && trustedCaptureResult.text);
+    const trustedCaptureMatches = Boolean(
+      trustedCaptureResult &&
+      trustedCaptureResult.selectionConfirmed &&
+      capturedAddress === normalizedAddress &&
+      capturedText === normalizedExpected
+    );
+
+    const checks = [];
+    let stableHits = 0;
+    let latest = null;
+    for (const waitMs of [50, 100, 200, 350, 500]) {
+      await sleep(waitMs);
+      const addressEcho = normalizeCellAddress(findCellAddressFromVisibleUi(null));
+      const formulaEditor = findBestFormulaEditor();
+      const observedText = normalizeCellText(formulaEditor ? extractEditableText(formulaEditor) : "");
+      const sheetCanvas = document.querySelector("canvas.faster-single-canvas");
+      const explicitAddressMatches = addressEcho === normalizedAddress;
+      const addressEvidenceMatches = explicitAddressMatches || (!addressEcho && trustedCaptureMatches);
+      const matched = Boolean(
+        addressEvidenceMatches &&
+        observedText === normalizedExpected &&
+        formulaEditor instanceof Element &&
+        isVisibleElement(formulaEditor) &&
+        sheetCanvas
+      );
+      stableHits = matched ? stableHits + 1 : 0;
+      latest = {
+        ok: false,
+        reason: matched
+          ? "captured_selection_waiting_for_stability"
+          : "captured_selection_continuity_not_verified",
+        address: normalizedAddress,
+        observedAddress: addressEcho || normalizedAddress,
+        addressEvidenceSource: explicitAddressMatches
+          ? "address_ui"
+          : (trustedCaptureMatches ? "last_trusted_capture" : "unavailable"),
+        context: normalizeCellContext(lastCellContext),
+        text: observedText,
+        formulaEditor,
+        selectionVerified: matched,
+        stableHits
+      };
+      checks.push({
+        waitMs,
+        capturedAddress,
+        addressEcho,
+        explicitAddressMatches,
+        trustedCaptureMatches,
+        addressEvidenceMatches,
+        capturedTextMatches: capturedText === normalizedExpected,
+        observedText,
+        expectedTextMatches: observedText === normalizedExpected,
+        stableHits,
+        activeElement: describeElementForDebug(getDeepActiveElement()),
+        formulaEditor: describeElementForDebug(formulaEditor),
+        sheetCanvas: describeElementForDebug(sheetCanvas)
+      });
+      if (stableHits >= 2) {
+        latest.ok = true;
+        latest.reason = "captured_selection_continuity_verified";
+        latest.checks = checks;
+        latest.navigation = navigationFailure;
+        latest.fingerprint = buildTargetFingerprint(observedText, normalizedAddress);
+        return latest;
+      }
+    }
+
+    return {
+      ...(latest || {}),
+      ok: false,
+      reason: navigationFailure && navigationFailure.reason
+        ? navigationFailure.reason
+        : "captured_selection_continuity_not_verified",
+      navigation: navigationFailure,
+      checks
+    };
+  }
+
+  async function navigateAndObserveCell(address, expectedText) {
+    const normalizedAddress = normalizeCellAddress(address);
+    if (!normalizedAddress) return { ok: false, reason: "invalid_target_address" };
+    const navigation = await navigateToCellAddress(normalizedAddress);
+    if (!navigation.ok) {
+      if (navigation.reason === "address_control_not_found" && arguments.length >= 2) {
+        return observeCapturedSelectionContinuity(
+          normalizedAddress,
+          expectedText,
+          navigation
+        );
+      }
+      return navigation;
+    }
+    const normalizedExpectedText = arguments.length >= 2
+      ? normalizeCellText(expectedText)
+      : null;
+    const checks = [];
+    let elapsedMs = 0;
+    let previousSignature = "";
+    let stableHits = 0;
+    let latest = null;
+
+    for (let index = 0; index < TARGET_NAVIGATION_CHECKPOINT_DELAYS_MS.length; index += 1) {
+      const waitMs = TARGET_NAVIGATION_CHECKPOINT_DELAYS_MS[index];
+      await sleep(waitMs);
+      elapsedMs += waitMs;
+
+      const activeCell = findCurrentActiveCellElement();
+      const context = getElementCenterContext(activeCell) || findSelectionOverlayContext();
+      const activeElement = getDeepActiveElement();
+      const addressControl = findCellAddressControl();
+      const sheetCanvas = document.querySelector("canvas.faster-single-canvas");
+      const activeCellAddress = normalizeCellAddress(extractCellAddressFromElement(activeCell));
+      const addressEcho = normalizeCellAddress(findCellAddressFromVisibleUi(context));
+      const addressEvidence = resolveAddressEvidence(normalizedAddress, activeCellAddress, addressEcho);
+      const formulaEditor = findBestFormulaEditor();
+      const text = normalizeCellText(formulaEditor ? extractEditableText(formulaEditor) : "");
+      const selectionVisible = Boolean(context || activeCell);
+      const sheetCanvasReady = Boolean(sheetCanvas);
+      const selectionSurfaceReady = selectionVisible || sheetCanvasReady;
+      const formulaReady = Boolean(formulaEditor instanceof Element && isVisibleElement(formulaEditor));
+      const addressVerified = addressEvidence.verified;
+      const addressEvidenceSource = addressEvidence.source;
+      const selectionVerified = Boolean(
+        addressVerified &&
+        selectionSurfaceReady &&
+        formulaReady
+      );
+      const selectionContextSignature = context
+        ? `${Math.round(context.x)}:${Math.round(context.y)}`
+        : "no-context";
+      const signature = [
+        addressVerified ? normalizedAddress : addressEvidence.observedAddress,
+        text,
+        formulaReady ? "formula" : "no-formula"
+      ].join("|");
+      stableHits = selectionVerified && signature === previousSignature ? stableHits + 1 : (selectionVerified ? 1 : 0);
+      previousSignature = selectionVerified ? signature : "";
+
+      latest = {
+        ok: false,
+        reason: selectionVerified ? "selection_observed_waiting_for_stability" : "target_selection_unverified",
+        address: normalizedAddress,
+        requestedAddress: normalizedAddress,
+        observedAddress: addressEvidence.observedAddress,
+        activeCellAddress,
+        addressEcho,
+        addressEvidenceSource,
+        addressEvidenceConflict: addressEvidence.conflict,
+        context,
+        text,
+        formulaEditor,
+        selectionVisible,
+        sheetCanvasReady,
+        selectionSurfaceReady,
+        formulaReady,
+        selectionVerified,
+        stableHits,
+        elapsedMs
+      };
+      checks.push({
+        round: index + 1,
+        waitMs,
+        elapsedMs,
+        observedAddress: latest.observedAddress,
+        activeCellAddress,
+        addressEcho,
+        addressEvidenceSource,
+        addressEvidenceConflict: addressEvidence.conflict,
+        selectionVisible,
+        sheetCanvasReady,
+        selectionSurfaceReady,
+        selectionContextSignature,
+        formulaReady,
+        selectionVerified,
+        stableHits,
+        observedText: text,
+        expectedTextMatches: normalizedExpectedText === null ? null : text === normalizedExpectedText,
+        activeElement: describeElementForDebug(activeElement),
+        activeCell: describeElementForDebug(activeCell),
+        addressControl: describeElementForDebug(addressControl),
+        formulaEditor: describeElementForDebug(formulaEditor),
+        sheetCanvas: describeElementForDebug(sheetCanvas),
+        viewport: {
+          innerWidth: window.innerWidth,
+          innerHeight: window.innerHeight,
+          scrollX: Math.round(window.scrollX || 0),
+          scrollY: Math.round(window.scrollY || 0),
+          devicePixelRatio: Number(window.devicePixelRatio || 1)
+        }
+      });
+
+      if (selectionVerified && stableHits >= 2 && elapsedMs >= TARGET_NAVIGATION_MIN_STABLE_MS) {
+        latest.ok = true;
+        latest.reason = "address_selection_and_formula_stable";
+        latest.checks = checks;
+        latest.navigation = navigation;
+        latest.fingerprint = buildTargetFingerprint(text, normalizedAddress);
+        return latest;
+      }
+    }
+
+    return {
+      ...(latest || {}),
+      ok: false,
+      reason: latest && latest.selectionVerified
+        ? "target_selection_not_stable"
+        : "target_selection_unverified",
+      requestedAddress: normalizedAddress,
+      checks,
+      navigation
+    };
+  }
+
+  async function navigateToCellAddress(address) {
+    let control = findCellAddressControl();
+    if (!(control instanceof Element)) {
+      const display = findCellAddressDisplay();
+      if (display instanceof Element) {
+        try {
+          display.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 }));
+          display.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 0 }));
+          display.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+          await sleep(30);
+          control = findCellAddressControl();
+        } catch (_) {}
+      }
+    }
+    if (!(control instanceof Element)) {
+      for (const waitMs of [30, 90, 180]) {
+        await sleep(waitMs);
+        control = findCellAddressControl();
+        if (control instanceof Element) break;
+      }
+    }
+    if (!(control instanceof Element)) {
+      return {
+        ok: false,
+        reason: "address_control_not_found",
+        diagnostics: collectAddressControlDiagnostics()
+      };
+    }
+    try {
+      control.focus();
+      if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) {
+        setNativeInputValue(control, address);
+        if (typeof control.select === "function") control.select();
+      } else if (isContentEditableElement(control)) {
+        selectAllContent(control);
+        let inserted = false;
+        try {
+          inserted = document.execCommand("insertText", false, address);
+        } catch (_) {}
+        if (!inserted) control.textContent = address;
+      } else {
+        return { ok: false, reason: "address_control_not_editable" };
+      }
+      control.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: address
+      }));
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+      const keyInit = {
+        bubbles: true,
+        cancelable: true,
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13
+      };
+      control.dispatchEvent(new KeyboardEvent("keydown", keyInit));
+      control.dispatchEvent(new KeyboardEvent("keypress", keyInit));
+      control.dispatchEvent(new KeyboardEvent("keyup", keyInit));
+      if (typeof control.blur === "function") control.blur();
+      return {
+        ok: true,
+        reason: "address_submitted",
+        address,
+        control: describeElementForDebug(control)
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error && error.message ? error.message : "address_navigation_failed"
+      };
+    }
+  }
+
+  function findCellAddressControl() {
+    const canvasRect = getSheetCanvasRect(lastCellContext);
+    const formulaEditor = findBestFormulaEditor();
+    const formulaRect = formulaEditor instanceof Element
+      ? formulaEditor.getBoundingClientRect()
+      : null;
+    const candidates = [];
+    document.querySelectorAll("input,textarea,[contenteditable]:not([contenteditable='false']),[role='textbox'],[role='combobox']").forEach((element) => {
+      if (!(element instanceof Element) || !isVisibleElement(element)) return;
+      if (element === formulaEditor) return;
+      const rect = element.getBoundingClientRect();
+      const values = collectAddressCandidateTexts(element);
+      const addressValue = values.map((value) => normalizeExactCellAddress(value)).find(Boolean);
+      const adjacencyScore = scoreFormulaAdjacentAddressControl(element, rect, formulaRect);
+      if (!addressValue && adjacencyScore <= 0) return;
+      if (!isLikelyAddressUiRect(rect, canvasRect) && adjacencyScore <= 0) return;
+      let score = scoreAddressUiCandidate(element, rect, canvasRect, addressValue || "");
+      score += adjacencyScore;
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) score += 18;
+      if (element.getAttribute("role") === "combobox") score += 10;
+      if (rect.width <= 140) score += 8;
+      candidates.push({
+        element,
+        score,
+        recognizedBy: addressValue ? "address_value" : "formula_adjacency"
+      });
+    });
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.length ? candidates[0].element : null;
+  }
+
+  function scoreFormulaAdjacentAddressControl(element, rect, formulaRect) {
+    if (!(element instanceof Element) || !rect || !formulaRect) return 0;
+    if (rect.width < 18 || rect.width > 180 || rect.height < 12 || rect.height > 56) return 0;
+    const verticalOverlap = Math.max(
+      0,
+      Math.min(rect.bottom, formulaRect.bottom) - Math.max(rect.top, formulaRect.top)
+    );
+    const minHeight = Math.max(1, Math.min(rect.height, formulaRect.height));
+    if (verticalOverlap / minHeight < 0.55) return 0;
+    const horizontalGap = formulaRect.left - rect.right;
+    if (horizontalGap < -12 || horizontalGap > 48) return 0;
+
+    let score = 90;
+    score += Math.max(0, 30 - Math.abs(horizontalGap));
+    score += Math.max(0, 24 - Math.abs(rect.top - formulaRect.top));
+    const hint = `${element.className || ""} ${element.id || ""}`.toLowerCase();
+    if (/native-input|name|address|coord|range|cell/.test(hint)) score += 24;
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) score += 16;
+    return score;
+  }
+
+  function collectAddressControlDiagnostics() {
+    const formulaEditor = findBestFormulaEditor();
+    const formulaRect = formulaEditor instanceof Element
+      ? formulaEditor.getBoundingClientRect()
+      : null;
+    const nearbyEditables = [];
+    document.querySelectorAll("input,textarea,[contenteditable]:not([contenteditable='false']),[role='textbox'],[role='combobox']").forEach((element) => {
+      if (!(element instanceof Element) || !isVisibleElement(element)) return;
+      const rect = element.getBoundingClientRect();
+      const adjacencyScore = scoreFormulaAdjacentAddressControl(element, rect, formulaRect);
+      if (adjacencyScore <= 0 && nearbyEditables.length >= 8) return;
+      nearbyEditables.push({
+        element: describeElementForDebug(element),
+        values: collectAddressCandidateTexts(element),
+        adjacencyScore
+      });
+    });
+    nearbyEditables.sort((left, right) => right.adjacencyScore - left.adjacencyScore);
+    return {
+      formulaEditor: describeElementForDebug(formulaEditor),
+      nearbyEditables: nearbyEditables.slice(0, 8)
+    };
+  }
+
+  function findCellAddressDisplay() {
+    const canvasRect = getSheetCanvasRect(lastCellContext);
+    const candidates = [];
+    document.querySelectorAll("div,span,button,[aria-label],[title]").forEach((element) => {
+      if (!(element instanceof Element) || !isVisibleElement(element)) return;
+      const rect = element.getBoundingClientRect();
+      if (!isLikelyAddressUiRect(rect, canvasRect)) return;
+      const values = collectAddressCandidateTexts(element);
+      const addressValue = values.map((value) => normalizeExactCellAddress(value)).find(Boolean);
+      if (!addressValue) return;
+      let score = scoreAddressUiCandidate(element, rect, canvasRect, addressValue);
+      if (element instanceof HTMLButtonElement || element.getAttribute("role") === "button") score += 12;
+      if (rect.width <= 140) score += 8;
+      candidates.push({ element, score });
+    });
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.length ? candidates[0].element : null;
+  }
+
+  function findSelectionOverlayContext() {
+    const canvasRect = getSheetCanvasRect(lastCellContext);
+    if (!canvasRect) return null;
+    const selectors = [
+      "[class*='active'][class*='cell']",
+      "[class*='selected'][class*='cell']",
+      "[class*='selection'][class*='range']",
+      "[class*='selection-border']",
+      "[class*='cell-border']"
+    ];
+    const candidates = [];
+    selectors.forEach((selector) => {
+      document.querySelectorAll(selector).forEach((element) => {
+        if (!(element instanceof Element) || !isVisibleElement(element) || isFormulaEditorElement(element)) return;
+        const rect = element.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        if (centerX < canvasRect.left || centerX > canvasRect.right ||
+          centerY < canvasRect.top || centerY > canvasRect.bottom) return;
+        if (rect.width > canvasRect.width || rect.height > canvasRect.height) return;
+        candidates.push({
+          context: normalizeCellContext({ x: centerX, y: centerY }),
+          area: rect.width * rect.height
+        });
+      });
+    });
+    candidates.sort((a, b) => a.area - b.area);
+    return candidates.length ? candidates[0].context : null;
+  }
+
+  function buildNearbyCellAddresses(address, limit) {
+    const origin = parseCellAddress(address);
+    if (!origin) return [];
+    const addresses = [];
+    const add = (rowOffset, columnOffset) => {
+      const row = origin.row + rowOffset;
+      const column = origin.column + columnOffset;
+      if (row <= 0 || column <= 0) return;
+      const candidate = `${indexToColumnName(column)}${row}`;
+      if (!addresses.includes(candidate)) addresses.push(candidate);
+    };
+    for (let distance = 1; addresses.length < limit && distance <= 18; distance += 1) {
+      add(-distance, 0);
+      add(distance, 0);
+      if (distance <= 9) {
+        add(0, -distance);
+        add(0, distance);
+      }
+      if (distance <= 3) {
+        add(-distance, -distance);
+        add(-distance, distance);
+        add(distance, -distance);
+        add(distance, distance);
+      }
+    }
+    return addresses.slice(0, limit);
+  }
+
+  function parseCellAddress(value) {
+    const normalized = normalizeCellAddress(value);
+    const match = normalized.match(/^([A-Z]{1,4})(\d{1,7})$/);
+    if (!match) return null;
+    let column = 0;
+    for (const char of match[1]) {
+      column = column * 26 + (char.charCodeAt(0) - 64);
+    }
+    return { column, row: Number(match[2]) };
+  }
+
+  function normalizeExactCellAddress(value) {
+    const text = String(value || "").trim().toUpperCase();
+    const match = text.match(/^\$?([A-Z]{1,4})\$?(\d{1,7})$/);
+    return match ? `${match[1]}${match[2]}` : "";
+  }
+
+  function scoreTargetFingerprint(expected, observed) {
+    if (!expected || !observed || !Array.isArray(expected.neighbors) || !Array.isArray(observed.neighbors)) return 0;
+    let score = 0;
+    expected.neighbors.forEach((left) => {
+      const right = observed.neighbors.find((item) =>
+        item.rowOffset === left.rowOffset && item.columnOffset === left.columnOffset);
+      if (right && normalizeCellText(right.text) === normalizeCellText(left.text)) score += 1;
+    });
+    return score;
+  }
+
+  function getFingerprintMatchThreshold(fingerprint) {
+    const neighbors = fingerprint && Array.isArray(fingerprint.neighbors)
+      ? fingerprint.neighbors
+      : [];
+    if (neighbors.length < 2) return 0;
+    return Math.min(3, neighbors.length);
+  }
+
+  function buildSuccessfulWriteResponse(message, logicalTarget, details) {
+    const target = logicalTarget && logicalTarget.target ? logicalTarget.target : normalizeIncomingTargetSnapshot(message);
+    const address = normalizeCellAddress(logicalTarget && logicalTarget.address || target.address);
+    const context = normalizeCellContext(logicalTarget && logicalTarget.context || target.context);
+    const writtenText = normalizeCellText(message && message.text);
+    return {
+      ok: true,
+      ...(details || {}),
+      cellAddress: address,
+      cellContext: context,
+      targetSnapshot: {
+        ...target,
+        text: writtenText,
+        address,
+        context,
+        fingerprint: buildTargetFingerprint(writtenText, address)
+      }
+    };
   }
 
   function resolveWriteTargetContext(message, requestedContext) {
@@ -1012,6 +2100,12 @@
   function buildWritePerformanceSummary(session, status, reason, durationMs) {
     const attempts = Array.isArray(session && session.attempts) ? session.attempts : [];
     const strategyStages = {
+      verified_selection_paste: "verified_selection_paste",
+      verified_selection_clear: "verified_selection_clear",
+      verified_selection_persisted: "verified_selection_verification",
+      verified_formula_write: "verified_formula_selection",
+      verified_formula_commit: "verified_formula_selection",
+      verified_formula_persisted: "verified_formula_selection",
       clear_strategy: "clear",
       paste_strategy: "synthetic_paste",
       native_paste_strategy: "native_clipboard_paste",
@@ -1022,7 +2116,16 @@
     };
     const attemptedStrategies = {};
     const fallbackPath = [];
-    const allStrategies = ["clear", "synthetic_paste", "native_clipboard_paste", "editor_direct_write"];
+    const allStrategies = [
+      "verified_selection_paste",
+      "verified_selection_clear",
+      "verified_selection_verification",
+      "verified_formula_selection",
+      "clear",
+      "synthetic_paste",
+      "native_clipboard_paste",
+      "editor_direct_write"
+    ];
     const stageTimings = attempts.map((attempt, index) => {
       const elapsedMs = Number(attempt && attempt.elapsedMs);
       const previousElapsedMs = index > 0 ? Number(attempts[index - 1] && attempts[index - 1].elapsedMs) : 0;
@@ -1065,6 +2168,9 @@
 
   function inferSuccessfulWriteStrategy(reason) {
     const text = String(reason || "");
+    if (text.includes("verified_selection_paste")) return "verified_selection_paste";
+    if (text.includes("verified_selection_clear")) return "verified_selection_clear";
+    if (text.includes("verified_formula")) return "verified_formula_selection";
     if (text.includes("clear")) return "clear";
     if (text.includes("native_paste")) return "native_clipboard_paste";
     if (text.includes("paste")) return "synthetic_paste";
@@ -1078,7 +2184,7 @@
 
   function getWriteStrategyAdaptationState() {
     return {
-      mode: "native_paste_first",
+      mode: "verified_selection_paste",
       preferNativePaste: true
     };
   }
@@ -1116,6 +2222,7 @@
     if (details == null) return null;
     if (typeof details === "string") return details.slice(0, 500);
     if (typeof details === "number" || typeof details === "boolean") return details;
+    if (details instanceof Element) return describeElementForDebug(details);
     if (Array.isArray(details)) return details.slice(0, 10).map((item) => sanitizeDebugDetails(item));
     if (typeof details === "object") {
       const result = {};
@@ -1436,13 +2543,46 @@
     return Boolean(previousAddress && currentAddress && previousAddress !== currentAddress);
   }
 
-  function rememberCaptureResult(text, cellAddress) {
+  function rememberCaptureResult(text, cellAddress, captureMeta) {
+    const pageIdentity = readSpreadsheetPageIdentity();
     lastCaptureResult = {
       text: normalizeCellText(text),
-      cellAddress: normalizeCellAddress(cellAddress)
+      cellAddress: normalizeCellAddress(cellAddress),
+      sheetId: pageIdentity.sheetId,
+      spreadsheetToken: pageIdentity.spreadsheetToken,
+      selectionConfirmed: Boolean(captureMeta && captureMeta.selectionConfirmed),
+      captureOrigin: String(captureMeta && captureMeta.captureOrigin || "unspecified"),
+      capturedAt: Number(captureMeta && captureMeta.capturedAt) || Date.now()
     };
+    const key = buildTrustedCaptureKey(lastCaptureResult.cellAddress, pageIdentity);
+    if (!key) return;
+    trustedCaptureResults.delete(key);
+    trustedCaptureResults.set(key, lastCaptureResult);
+    while (trustedCaptureResults.size > 40) {
+      const oldestKey = trustedCaptureResults.keys().next().value;
+      trustedCaptureResults.delete(oldestKey);
+    }
   }
 
+  function findTrustedCaptureResult(cellAddress) {
+    const pageIdentity = readSpreadsheetPageIdentity();
+    const normalizedAddress = normalizeCellAddress(cellAddress);
+    const key = buildTrustedCaptureKey(normalizedAddress, pageIdentity);
+    if (key && trustedCaptureResults.has(key)) return trustedCaptureResults.get(key);
+    if (!lastCaptureResult || normalizeCellAddress(lastCaptureResult.cellAddress) !== normalizedAddress) return null;
+    if (String(lastCaptureResult.sheetId || "") !== String(pageIdentity.sheetId || "")) return null;
+    if (String(lastCaptureResult.spreadsheetToken || "") !== String(pageIdentity.spreadsheetToken || "")) return null;
+    return lastCaptureResult;
+  }
+
+  function buildTrustedCaptureKey(cellAddress, pageIdentity) {
+    const normalizedAddress = normalizeCellAddress(cellAddress);
+    const identity = pageIdentity || readSpreadsheetPageIdentity();
+    const documentKey = String(identity && identity.spreadsheetToken || location.pathname || "");
+    const sheetKey = String(identity && identity.sheetId || "");
+    if (!normalizedAddress || !documentKey) return "";
+    return [documentKey, sheetKey, normalizedAddress].join("\u0000");
+  }
   function isCurrentCellAddressToken(text, cellAddress) {
     const value = normalizeCellAddress(text);
     if (!value) return false;
@@ -1633,6 +2773,36 @@
     };
   }
 
+  async function runVerifiedSelectionPasteStrategy(text, message) {
+    const nativeResult = await runNativeClipboardPasteStrategy(text, null, {
+      clipboardPrimed: Boolean(message && message.clipboardPrimed)
+    });
+    if (nativeResult && nativeResult.ok) {
+      return {
+        ok: true,
+        reason: "verified_selection_native_paste_persisted",
+        observedFormula: nativeResult.observedFormula || "",
+        selectedRoute: "native_clipboard_paste",
+        nativeResult,
+        syntheticResult: null
+      };
+    }
+
+    const syntheticResult = await runPasteWriteStrategy(text, null);
+    return {
+      ok: Boolean(syntheticResult && syntheticResult.ok),
+      reason: syntheticResult && syntheticResult.ok
+        ? "verified_selection_synthetic_paste_persisted"
+        : "verified_selection_paste_not_persisted",
+      observedFormula: syntheticResult && typeof syntheticResult.observedFormula === "string"
+        ? syntheticResult.observedFormula
+        : (nativeResult && typeof nativeResult.observedFormula === "string" ? nativeResult.observedFormula : ""),
+      selectedRoute: syntheticResult && syntheticResult.ok ? "synthetic_clipboard_event" : "none",
+      nativeResult,
+      syntheticResult
+    };
+  }
+
   async function waitForFormulaMatch(normalizedTarget, waits) {
     const checks = [];
     let observedFormula = "";
@@ -1813,6 +2983,25 @@
       ok: false,
       reason: "native_clipboard_paste_not_persisted",
       observedFormula: observations.length ? observations[observations.length - 1].observedFormula : normalizeCellText(probeFormulaBarText()),
+      actions,
+      observations
+    };
+  }
+
+  async function runVerifiedSelectionClearStrategy() {
+    const actions = [];
+    const observations = [];
+    const result = await tryClearByKeyTargets(
+      null,
+      actions,
+      observations,
+      "verified_selection_clear_key"
+    );
+    if (result) return result;
+    return {
+      ok: false,
+      reason: "verified_selection_clear_not_persisted",
+      observedFormula: normalizeCellText(probeFormulaBarText()),
       actions,
       observations
     };
@@ -2024,6 +3213,7 @@
       targets.push(target);
     };
 
+    add(document.querySelector("canvas.faster-single-canvas"));
     add(resolveEditableRoot(getDeepActiveElement()));
 
     if (context && Number.isFinite(context.x) && Number.isFinite(context.y)) {
@@ -2618,11 +3808,13 @@
     return name;
   }
 
-  function emitCellSelected(text, source, context, cellAddress) {
+  function emitCellSelected(text, source, context, cellAddress, captureMeta) {
     const normalized = normalizeCellText(text);
     const cellContext = normalizeCellContext(context) || lastCellContext;
     lastCellContext = cellContext || lastCellContext;
     const resolvedAddress = resolveCellAddress(null, cellContext);
+    const address = normalizeCellAddress(cellAddress) || resolvedAddress;
+    const pageIdentity = readSpreadsheetPageIdentity();
     sendMessage({
       type: "FZ_CELL_SELECTED",
       text: normalized,
@@ -2630,8 +3822,67 @@
       pageTitle: document.title,
       pageUrl: location.href,
       cellContext: cellContext || null,
-      cellAddress: resolvedAddress || normalizeCellAddress(cellAddress)
+      cellAddress: address,
+      sheetId: pageIdentity.sheetId,
+      spreadsheetToken: pageIdentity.spreadsheetToken,
+      targetSnapshot: {
+        text: normalized,
+        address,
+        context: cellContext || null,
+        pageUrl: location.href,
+        sheetId: pageIdentity.sheetId,
+        spreadsheetToken: pageIdentity.spreadsheetToken,
+        fingerprint: buildTargetFingerprint(normalized, address),
+        selectionConfirmed: Boolean(captureMeta && captureMeta.selectionConfirmed && address),
+        captureOrigin: String(captureMeta && captureMeta.captureOrigin || "unspecified"),
+        capturedAt: Number(captureMeta && captureMeta.capturedAt) || Date.now()
+      }
     });
+  }
+
+  function readSpreadsheetPageIdentity() {
+    try {
+      const url = new URL(location.href);
+      const tokenMatch = url.pathname.match(/\/sheets\/([^/?#]+)/i);
+      return {
+        spreadsheetToken: tokenMatch ? decodeURIComponent(tokenMatch[1]) : "",
+        sheetId: String(url.searchParams.get("sheet") || url.searchParams.get("sheetId") || "")
+      };
+    } catch (_) {
+      return { spreadsheetToken: "", sheetId: "" };
+    }
+  }
+
+  function buildTargetFingerprint(text, address) {
+    return {
+      text: normalizeCellText(text),
+      address: normalizeCellAddress(address),
+      neighbors: collectVisibleNeighborFingerprint(address)
+    };
+  }
+
+  function collectVisibleNeighborFingerprint(address) {
+    const origin = parseCellAddress(address);
+    if (!origin) return [];
+    const neighbors = [];
+    document.querySelectorAll(CELL_SELECTOR).forEach((element) => {
+      if (!(element instanceof Element) || !isVisibleElement(element)) return;
+      const candidateAddress = extractCellAddressFromElement(element);
+      const candidate = parseCellAddress(candidateAddress);
+      if (!candidate) return;
+      const rowOffset = candidate.row - origin.row;
+      const columnOffset = candidate.column - origin.column;
+      if (rowOffset === 0 && columnOffset === 0) return;
+      if (Math.abs(rowOffset) > 2 || Math.abs(columnOffset) > 2) return;
+      const candidateText = normalizeCellText(extractTextFromElement(element, true));
+      neighbors.push({ rowOffset, columnOffset, text: candidateText });
+    });
+    neighbors.sort((a, b) => {
+      const distanceA = Math.abs(a.rowOffset) + Math.abs(a.columnOffset);
+      const distanceB = Math.abs(b.rowOffset) + Math.abs(b.columnOffset);
+      return distanceA - distanceB;
+    });
+    return neighbors.slice(0, 12);
   }
 
   function finalizeSession(session, status, chosenSource) {

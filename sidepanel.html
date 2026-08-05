@@ -4,50 +4,137 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>CellPeek</title>
+    <link rel="stylesheet" href="vendor/katex/katex.min.css">
     <link rel="stylesheet" href="sidepanel.css">
   </head>
   <body>
     <main class="fz-shell">
       <header class="fz-toolbar">
         <div class="fz-title">CellPeek</div>
-        <div class="fz-actions">
-          <button class="fz-btn fz-active" data-action="split-single" title="单栏">单</button>
-          <button class="fz-btn" data-action="split-vertical" title="左右分栏">左右</button>
-          <button class="fz-btn" data-action="split-horizontal" title="上下分栏">上下</button>
+        <div class="fz-layout-switch" role="group" aria-label="分栏布局">
+          <button class="fz-btn fz-layout-btn fz-active" data-action="split-single" data-tooltip="单栏" aria-label="切换为单栏">
+            <svg class="fz-layout-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <rect x="3" y="4" width="14" height="12" rx="2"></rect>
+            </svg>
+          </button>
+          <button class="fz-btn fz-layout-btn" data-action="split-vertical" data-tooltip="左右分栏" aria-label="切换为左右分栏">
+            <svg class="fz-layout-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <rect x="3" y="4" width="14" height="12" rx="2"></rect>
+              <path d="M10 4v12"></path>
+            </svg>
+          </button>
+          <button class="fz-btn fz-layout-btn" data-action="split-horizontal" data-tooltip="上下分栏" aria-label="切换为上下分栏">
+            <svg class="fz-layout-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <rect x="3" y="4" width="14" height="12" rx="2"></rect>
+              <path d="M3 10h14"></path>
+            </svg>
+          </button>
         </div>
       </header>
 
       <section class="fz-panes fz-single">
         <article class="fz-pane fz-pane-active" data-pane="0">
           <div class="fz-pane-head">
-            <div class="fz-view-mode" aria-label="展示模式">
-              <button class="fz-mode-btn fz-active" data-mode="auto">自动</button>
-              <button class="fz-mode-btn" data-mode="md">MD</button>
-              <button class="fz-mode-btn" data-mode="json">JSON</button>
-              <button class="fz-mode-btn" data-mode="raw">原文</button>
+            <div class="fz-view-mode">
+              <button class="fz-mode-trigger" data-action="toggle-mode-menu" data-mode-trigger aria-haspopup="listbox" aria-expanded="false" aria-controls="mode-menu-0" aria-label="选择展示格式">
+                <span data-mode-label>自动</span>
+                <svg class="fz-mode-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4.5 6 3.5 3.5L11.5 6"></path></svg>
+              </button>
+              <div class="fz-mode-menu" id="mode-menu-0" data-mode-menu role="listbox" aria-label="展示格式" hidden>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="auto" role="option" aria-selected="true" tabindex="-1"><span>自动</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="md" role="option" aria-selected="false" tabindex="-1"><span>MD</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="json" role="option" aria-selected="false" tabindex="-1"><span>JSON</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="raw" role="option" aria-selected="false" tabindex="-1"><span>原文</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+              </div>
             </div>
             <div class="fz-pane-actions">
-              <button class="fz-btn fz-type-btn" data-action="type" title="键入模式" aria-label="键入模式">✎</button>
-              <button class="fz-btn fz-lock-btn" data-action="lock" title="点击锁定" aria-label="点击锁定">🔓</button>
+              <button class="fz-btn fz-type-btn" data-action="type" data-tooltip="键入" aria-label="键入当前单元格内容">
+                <svg class="fz-action-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m4.25 15.75.75-3 7.9-7.9a1.75 1.75 0 0 1 2.48 2.48l-7.9 7.9-3.23.52Z"></path><path d="m11.75 6 2.25 2.25"></path></svg>
+              </button>
+              <button class="fz-btn fz-copy-btn" data-action="copy" data-tooltip="复制" aria-label="复制展示内容">
+                <svg class="fz-action-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="6.5" y="4.5" width="9" height="9" rx="1.75"></rect><path d="M13.5 13.5v1a1.5 1.5 0 0 1-1.5 1.5H5.5A1.5 1.5 0 0 1 4 14.5V8a1.5 1.5 0 0 1 1.5-1.5h1"></path></svg>
+              </button>
+              <button class="fz-btn fz-lock-btn" data-action="lock" data-tooltip="锁定" aria-label="锁定当前分栏">
+                <svg class="fz-action-icon fz-lock-open-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="4.5" y="8.5" width="11" height="7.5" rx="2"></rect><path d="M7 8.5V6.75a3 3 0 0 1 5.6-1.5"></path><path d="M10 11.5v1.75"></path></svg>
+                <svg class="fz-action-icon fz-lock-closed-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="4.5" y="8.5" width="11" height="7.5" rx="2"></rect><path d="M7 8.5V6.75a3 3 0 0 1 6 0V8.5"></path><path d="M10 11.5v1.75"></path></svg>
+              </button>
             </div>
+          </div>
+          <div class="fz-cell-meta" aria-label="单元格信息">
+            <div class="fz-cell-meta-left">
+              <span class="fz-cell-address"></span>
+              <button class="fz-search-trigger" data-action="toggle-search" data-tooltip="查询" aria-label="查询当前展示内容" aria-expanded="false" aria-controls="pane-search-0">
+                <svg class="fz-search-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="4.25"></circle><path d="m11.75 11.75 3 3"></path></svg>
+              </button>
+            </div>
+            <span class="fz-cell-count">0 字</span>
+          </div>
+          <div class="fz-search-panel" id="pane-search-0" aria-hidden="true">
+            <button class="fz-search-panel-toggle" data-action="toggle-search" data-tooltip="收起查询" aria-label="收起查询" disabled tabindex="-1">
+              <svg class="fz-search-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="4.25"></circle><path d="m11.75 11.75 3 3"></path></svg>
+            </button>
+            <input class="fz-search-input" type="search" placeholder="查询当前内容" aria-label="查询当前展示内容" autocomplete="off" spellcheck="false" disabled tabindex="-1">
+            <span class="fz-search-count" role="status" aria-live="polite"></span>
+            <button class="fz-search-nav" data-action="search-prev" data-tooltip="上一处" aria-label="上一处匹配" disabled tabindex="-1">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4.5 9.5 3.5-3 3.5 3"></path></svg>
+            </button>
+            <button class="fz-search-nav" data-action="search-next" data-tooltip="下一处" aria-label="下一处匹配" disabled tabindex="-1">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4.5 6.5 3.5 3 3.5-3"></path></svg>
+            </button>
           </div>
           <div class="fz-content"></div>
         </article>
 
-        <div class="fz-splitter" data-action="resize-split" title="拖动调整分栏大小"></div>
+        <div class="fz-splitter" data-action="resize-split" role="separator" aria-label="调整分栏大小" aria-valuemin="10" aria-valuemax="90" aria-valuenow="50" tabindex="0"></div>
 
         <article class="fz-pane" data-pane="1">
           <div class="fz-pane-head">
-            <div class="fz-view-mode" aria-label="展示模式">
-              <button class="fz-mode-btn fz-active" data-mode="auto">自动</button>
-              <button class="fz-mode-btn" data-mode="md">MD</button>
-              <button class="fz-mode-btn" data-mode="json">JSON</button>
-              <button class="fz-mode-btn" data-mode="raw">原文</button>
+            <div class="fz-view-mode">
+              <button class="fz-mode-trigger" data-action="toggle-mode-menu" data-mode-trigger aria-haspopup="listbox" aria-expanded="false" aria-controls="mode-menu-1" aria-label="选择展示格式">
+                <span data-mode-label>自动</span>
+                <svg class="fz-mode-chevron" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4.5 6 3.5 3.5L11.5 6"></path></svg>
+              </button>
+              <div class="fz-mode-menu" id="mode-menu-1" data-mode-menu role="listbox" aria-label="展示格式" hidden>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="auto" role="option" aria-selected="true" tabindex="-1"><span>自动</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="md" role="option" aria-selected="false" tabindex="-1"><span>MD</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="json" role="option" aria-selected="false" tabindex="-1"><span>JSON</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+                <button class="fz-mode-option" data-action="select-mode" data-mode="raw" role="option" aria-selected="false" tabindex="-1"><span>原文</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"></path></svg></button>
+              </div>
             </div>
             <div class="fz-pane-actions">
-              <button class="fz-btn fz-type-btn" data-action="type" title="键入模式" aria-label="键入模式">✎</button>
-              <button class="fz-btn fz-lock-btn" data-action="lock" title="点击锁定" aria-label="点击锁定">🔓</button>
+              <button class="fz-btn fz-type-btn" data-action="type" data-tooltip="键入" aria-label="键入当前单元格内容">
+                <svg class="fz-action-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><path d="m4.25 15.75.75-3 7.9-7.9a1.75 1.75 0 0 1 2.48 2.48l-7.9 7.9-3.23.52Z"></path><path d="m11.75 6 2.25 2.25"></path></svg>
+              </button>
+              <button class="fz-btn fz-copy-btn" data-action="copy" data-tooltip="复制" aria-label="复制展示内容">
+                <svg class="fz-action-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="6.5" y="4.5" width="9" height="9" rx="1.75"></rect><path d="M13.5 13.5v1a1.5 1.5 0 0 1-1.5 1.5H5.5A1.5 1.5 0 0 1 4 14.5V8a1.5 1.5 0 0 1 1.5-1.5h1"></path></svg>
+              </button>
+              <button class="fz-btn fz-lock-btn" data-action="lock" data-tooltip="锁定" aria-label="锁定当前分栏">
+                <svg class="fz-action-icon fz-lock-open-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="4.5" y="8.5" width="11" height="7.5" rx="2"></rect><path d="M7 8.5V6.75a3 3 0 0 1 5.6-1.5"></path><path d="M10 11.5v1.75"></path></svg>
+                <svg class="fz-action-icon fz-lock-closed-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="4.5" y="8.5" width="11" height="7.5" rx="2"></rect><path d="M7 8.5V6.75a3 3 0 0 1 6 0V8.5"></path><path d="M10 11.5v1.75"></path></svg>
+              </button>
             </div>
+          </div>
+          <div class="fz-cell-meta" aria-label="单元格信息">
+            <div class="fz-cell-meta-left">
+              <span class="fz-cell-address"></span>
+              <button class="fz-search-trigger" data-action="toggle-search" data-tooltip="查询" aria-label="查询当前展示内容" aria-expanded="false" aria-controls="pane-search-1">
+                <svg class="fz-search-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="4.25"></circle><path d="m11.75 11.75 3 3"></path></svg>
+              </button>
+            </div>
+            <span class="fz-cell-count">0 字</span>
+          </div>
+          <div class="fz-search-panel" id="pane-search-1" aria-hidden="true">
+            <button class="fz-search-panel-toggle" data-action="toggle-search" data-tooltip="收起查询" aria-label="收起查询" disabled tabindex="-1">
+              <svg class="fz-search-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="4.25"></circle><path d="m11.75 11.75 3 3"></path></svg>
+            </button>
+            <input class="fz-search-input" type="search" placeholder="查询当前内容" aria-label="查询当前展示内容" autocomplete="off" spellcheck="false" disabled tabindex="-1">
+            <span class="fz-search-count" role="status" aria-live="polite"></span>
+            <button class="fz-search-nav" data-action="search-prev" data-tooltip="上一处" aria-label="上一处匹配" disabled tabindex="-1">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4.5 9.5 3.5-3 3.5 3"></path></svg>
+            </button>
+            <button class="fz-search-nav" data-action="search-next" data-tooltip="下一处" aria-label="下一处匹配" disabled tabindex="-1">
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4.5 6.5 3.5 3 3.5-3"></path></svg>
+            </button>
           </div>
           <div class="fz-content"></div>
         </article>
@@ -55,14 +142,18 @@
 
       <section class="fz-debug">
         <button class="fz-debug-toggle" data-action="toggle-debug" aria-expanded="false">
-          调试
-          <span class="fz-debug-alert-dot" hidden></span>
+          <span class="fz-debug-toggle-label">
+            <svg class="fz-debug-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="2"></rect><path d="m6 7 2.5 3L6 13"></path><path d="M10.5 13H14"></path></svg>
+            <span>调试</span>
+            <span class="fz-debug-alert-dot" hidden></span>
+          </span>
+          <svg class="fz-debug-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6 3.5 3.5L11.5 6"></path></svg>
         </button>
         <div class="fz-debug-panel" hidden>
           <div class="fz-debug-head">
             <span class="fz-debug-count">最近 0 条</span>
             <div class="fz-debug-actions">
-              <button class="fz-btn" data-action="copy-debug">复制调试信息</button>
+              <button class="fz-btn" data-action="copy-debug">复制报告</button>
               <button class="fz-btn" data-action="clear-debug">清空</button>
             </div>
           </div>
@@ -70,8 +161,11 @@
         </div>
       </section>
 
-      <div class="fz-toast"></div>
+      <div class="fz-tooltip" role="tooltip" hidden></div>
+      <div class="fz-toast" role="status" aria-live="polite"></div>
     </main>
+    <script src="vendor/katex/katex.min.js"></script>
+    <script src="vendor/markdown-it.min.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>
