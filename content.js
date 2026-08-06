@@ -29,6 +29,19 @@
     "[placeholder*='公式' i]",
     "[placeholder*='fx' i]"
   ];
+  const READ_ONLY_FORMULA_VALUE_SELECTORS = [
+    "[aria-readonly='true']",
+    "[data-readonly='true']",
+    "[data-read-only='true']",
+    "[data-editable='false']",
+    "[aria-valuetext]",
+    "[data-cell-value]",
+    "[data-raw-value]",
+    "[data-value]",
+    "[class*='readonly' i]",
+    "[class*='read-only' i]",
+    "[role='textbox']"
+  ];
   const ACTIVE_CELL_SELECTORS = [
     "[aria-selected='true']",
     "[data-selected='true']",
@@ -114,6 +127,7 @@
       suppressEmpty: Boolean(options && options.suppressEmpty),
       allowStableEmpty: Boolean(options && options.allowStableEmpty),
       captureOrigin: String(options && options.captureOrigin || (event && event.isTrusted ? "user_selection" : "unspecified")),
+      cellAccessMode: "unknown",
       state: "running"
     };
     currentSession = session;
@@ -152,15 +166,16 @@
     }
 
     const probes = [
-      { key: "formula", source: "公式栏输入区", run: probeFormulaBarText }
+      { key: "formula_editable", source: "公式栏输入区", run: probeFormulaEditorCapture },
+      { key: "formula_readonly", source: "公式栏只读值", run: probeReadOnlyFormulaBarCapture }
     ];
 
     let stepFormulaEmpty = false;
     let stepFormulaConfirmedEmpty = false;
 
     for (const probe of probes) {
-      const raw = safelyRunProbe(probe.run);
-      const text = normalizeCellText(raw);
+      const probeResult = safelyRunCaptureProbe(probe.run);
+      const text = normalizeCellText(probeResult.text);
       const baseEvaluation = evaluateCandidate(text, probe.key, session.cellAddress);
       const evaluation = refineFormulaCaptureEvaluation(session, probe.key, text, baseEvaluation);
 
@@ -172,7 +187,7 @@
         reason: evaluation.reason,
         candidateLength: text.length,
         candidateSample: sampleText(text),
-        details: evaluation.details || null
+        details: mergeCaptureProbeDetails(probeResult.details, evaluation.details)
       });
 
       if (evaluation.status === "blocked") {
@@ -181,8 +196,8 @@
         return;
       }
 
-      if (probe.key === "formula" && ["cell_address_token", "empty", "not_useful"].includes(evaluation.reason)) stepFormulaEmpty = true;
-      if (probe.key === "formula" && evaluation.reason === "empty") {
+      if (probe.key.startsWith("formula") && ["cell_address_token", "empty", "not_useful"].includes(evaluation.reason)) stepFormulaEmpty = true;
+      if (probe.key === "formula_editable" && evaluation.reason === "empty") {
         const formulaEditor = findBestFormulaEditor();
         stepFormulaConfirmedEmpty = Boolean(
           formulaEditor instanceof Element &&
@@ -194,6 +209,7 @@
       if (evaluation.status !== "success") continue;
       if (!isCaptureAddressConfirmed(session)) continue;
 
+      session.cellAccessMode = normalizeCellAccessMode(probeResult.cellAccessMode);
       const captureMeta = createCaptureSnapshotMeta(session);
       rememberCaptureResult(text, session.cellAddress, captureMeta);
       emitCellSelected(text, probe.source, session.clickContext, session.cellAddress, captureMeta);
@@ -283,6 +299,7 @@
     return {
       selectionConfirmed: isCaptureAddressConfirmed(session),
       captureOrigin: String(session && session.captureOrigin || "unspecified"),
+      cellAccessMode: normalizeCellAccessMode(session && session.cellAccessMode),
       capturedAt: Date.now()
     };
   }
@@ -2301,9 +2318,267 @@
     };
   }
 
+  function probeFormulaEditorCapture() {
+    const editor = findBestFormulaEditor();
+    const readerReady = Boolean(editor instanceof Element && isVisibleElement(editor) && resolveFormulaElementAccessMode(editor) !== "unknown");
+    return {
+      text: readerReady ? extractEditableText(editor) : "",
+      cellAccessMode: readerReady ? resolveFormulaElementAccessMode(editor) : "unknown",
+      details: {
+        readerKind: "formula_editor",
+        reader: describeElementForDebug(editor),
+        readerReady,
+        explicitReadOnly: isExplicitReadOnlyFormulaElement(editor)
+      }
+    };
+  }
+
   function probeFormulaBarText() {
     const editor = findBestFormulaEditor();
     return editor ? extractEditableText(editor) : "";
+  }
+
+  function probeReadOnlyFormulaBarCapture() {
+    const editableEditor = findVisibleEditableFormulaEditor();
+    if (editableEditor) {
+      return {
+        text: "",
+        cellAccessMode: "unknown",
+        details: { readerKind: "formula_readonly", editableEditorPresent: true }
+      };
+    }
+    const candidate = findBestReadOnlyFormulaReader();
+    return {
+      text: candidate ? candidate.text : "",
+      cellAccessMode: candidate ? "read-only" : "unknown",
+      details: {
+        readerKind: "formula_readonly",
+        reader: describeElementForDebug(candidate && candidate.element),
+        valueBoundary: candidate ? candidate.valueBoundary : "",
+        textFragmentCount: candidate ? candidate.textFragmentCount : 0,
+        explicitReadOnly: Boolean(candidate && candidate.explicitReadOnly),
+        editableEditorPresent: false,
+        score: candidate ? candidate.score : 0
+      }
+    };
+  }
+
+  function findVisibleEditableFormulaEditor() {
+    const editor = findBestFormulaEditor();
+    if (!(editor instanceof Element) || !isVisibleElement(editor)) return null;
+    return resolveFormulaElementAccessMode(editor) === "editable" ? editor : null;
+  }
+
+  function findBestReadOnlyFormulaReader() {
+    const seen = new Set();
+    const candidates = [];
+    const hosts = collectReadOnlyFormulaHosts();
+
+    hosts.forEach((host) => {
+      addReadOnlyFormulaCandidate(host, host, seen, candidates);
+      READ_ONLY_FORMULA_VALUE_SELECTORS.forEach((readerSelector) => {
+        host.querySelectorAll(readerSelector).forEach((element) => {
+          addReadOnlyFormulaCandidate(element, host, seen, candidates);
+        });
+      });
+      host.querySelectorAll("span,div,[role='textbox']").forEach((element) => {
+        addReadOnlyFormulaCandidate(element, host, seen, candidates);
+      });
+    });
+
+    candidates.sort(compareReadOnlyFormulaCandidates);
+    return candidates.length ? candidates[0] : null;
+  }
+
+  function collectReadOnlyFormulaHosts() {
+    const hosts = [];
+    const seen = new Set();
+    FORMULA_SELECTORS.forEach((selector) => {
+      document.querySelectorAll(selector).forEach((element) => {
+        if (!(element instanceof Element) || seen.has(element) || !isVisibleElement(element)) return;
+        seen.add(element);
+        hosts.push(element);
+      });
+    });
+    return hosts.filter((host) => !hosts.some((ancestor) => ancestor !== host && ancestor.contains(host)));
+  }
+
+  function addReadOnlyFormulaCandidate(element, host, seen, candidates) {
+    if (!(element instanceof Element) || seen.has(element) || !isVisibleElement(element)) return;
+    seen.add(element);
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || isContentEditableElement(element)) return;
+    if (element.closest("button,[role='button'],[role='menuitem'],[role='tab']")) return;
+
+    const content = readReadOnlyFormulaContent(element);
+    const text = content.text;
+    if (!text || !isUsefulText(text) || isFormulaReaderLabel(text) || isLikelyCellAddressToken(text)) return;
+    const explicitReadOnly = isExplicitReadOnlyFormulaElement(element);
+    const valueBoundary = classifyReadOnlyValueBoundary(element, host);
+    if (!valueBoundary && content.textFragmentCount < 2) return;
+    const score = scoreReadOnlyFormulaCandidate(element, host, text, explicitReadOnly, valueBoundary, content.textFragmentCount);
+    if (score < 70) return;
+    candidates.push({
+      element,
+      text,
+      score,
+      explicitReadOnly,
+      valueBoundary,
+      textFragmentCount: content.textFragmentCount
+    });
+  }
+
+  function readReadOnlyFormulaContent(element) {
+    if (!(element instanceof Element)) return { text: "", textFragmentCount: 0 };
+    const valueAttrs = [
+      "data-cell-value",
+      "data-raw-value",
+      "data-value",
+      "data-content",
+      "data-text",
+      "aria-valuetext"
+    ];
+    for (const attr of valueAttrs) {
+      const value = normalizeCellText(element.getAttribute(attr));
+      if (value && value.length <= 50000 && !isFormulaReaderLabel(value)) {
+        return { text: value, textFragmentCount: 1 };
+      }
+    }
+    const fragments = [];
+    collectReadOnlyValueTextFragments(element, element, fragments);
+    const text = normalizeCellText(fragments.join(""));
+    return text.length <= 50000
+      ? { text, textFragmentCount: fragments.length }
+      : { text: "", textFragmentCount: 0 };
+  }
+
+  function collectReadOnlyValueTextFragments(node, root, fragments) {
+    if (!node) return;
+    if (node.nodeType === 3) {
+      const value = String(node.nodeValue || "");
+      if (value) fragments.push(value);
+      return;
+    }
+    if (node instanceof Element) {
+      if (node !== root && node.matches("button,[role='button'],[role='menuitem'],[role='tab']")) return;
+      if ((node.getAttribute("aria-hidden") || "").toLowerCase() === "true") return;
+    }
+
+    const childNodes = Array.from(node.childNodes || []);
+    if (childNodes.length) {
+      childNodes.forEach((child) => collectReadOnlyValueTextFragments(child, root, fragments));
+      return;
+    }
+
+    if (node instanceof Element) {
+      const fallback = String(node.textContent || "");
+      if (fallback) fragments.push(fallback);
+    }
+  }
+
+  function hasReadOnlyFormulaValueAttribute(element) {
+    return ["data-cell-value", "data-raw-value", "data-value", "data-content", "data-text", "aria-valuetext"]
+      .some((attr) => element.hasAttribute(attr));
+  }
+
+  function classifyReadOnlyValueBoundary(element, host) {
+    const role = (element.getAttribute("role") || "").toLowerCase();
+    if (role === "textbox") return "textbox";
+    if (hasReadOnlyFormulaValueAttribute(element)) return "value_attribute";
+
+    const hint = `${element.className || ""} ${element.id || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
+    const isFormulaValue = /formula[-_\s]?bar|formula.*(?:value|editor|content|input|display|text)|(?:value|editor|content|input|display|text).*formula|fx.*(?:value|editor|content|input|display|text)/.test(hint);
+    if (isFormulaValue) return element === host ? "formula_host" : "formula_value";
+    return "";
+  }
+
+  function compareReadOnlyFormulaCandidates(left, right) {
+    if (readOnlyCandidateDominates(left, right)) return -1;
+    if (readOnlyCandidateDominates(right, left)) return 1;
+
+    const boundaryDifference = readOnlyValueBoundaryRank(right.valueBoundary) - readOnlyValueBoundaryRank(left.valueBoundary);
+    if (boundaryDifference) return boundaryDifference;
+    const fragmentDifference = right.textFragmentCount - left.textFragmentCount;
+    if (fragmentDifference) return fragmentDifference;
+    const scoreDifference = right.score - left.score;
+    if (scoreDifference) return scoreDifference;
+    return right.text.length - left.text.length;
+  }
+
+  function readOnlyCandidateDominates(container, fragment) {
+    if (!container || !fragment || container.element === fragment.element || !container.element.contains(fragment.element)) return false;
+    if (!candidateTextCovers(container, fragment) || container.textFragmentCount <= fragment.textFragmentCount) return false;
+
+    const containerRank = readOnlyValueBoundaryRank(container.valueBoundary);
+    const fragmentRank = readOnlyValueBoundaryRank(fragment.valueBoundary);
+    if (containerRank >= fragmentRank) return true;
+
+    const containerIsFormula = normalizeCellText(container.text).startsWith("=");
+    const fragmentIsFormula = normalizeCellText(fragment.text).startsWith("=");
+    return containerIsFormula && (!fragmentIsFormula || container.textFragmentCount >= fragment.textFragmentCount + 2);
+  }
+
+  function candidateTextCovers(container, fragment) {
+    const containerText = normalizeCellText(container && container.text);
+    const fragmentText = normalizeCellText(fragment && fragment.text);
+    return Boolean(containerText && fragmentText && (containerText === fragmentText || containerText.includes(fragmentText)));
+  }
+
+  function readOnlyValueBoundaryRank(value) {
+    switch (value) {
+      case "value_attribute": return 5;
+      case "textbox": return 4;
+      case "formula_value": return 3;
+      case "formula_host": return 2;
+      default: return 1;
+    }
+  }
+
+  function scoreReadOnlyFormulaCandidate(element, host, text, explicitReadOnly, valueBoundary, textFragmentCount) {
+    let score = 0;
+    const rect = element.getBoundingClientRect();
+    const hint = `${element.className || ""} ${element.id || ""} ${element.getAttribute("role") || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
+    score += readOnlyValueBoundaryRank(valueBoundary) * 35;
+    if (textFragmentCount >= 2) score += 35 + Math.min(120, textFragmentCount * 18);
+    if (explicitReadOnly) score += 20;
+    if (/readonly|read-only|disabled/.test(hint)) score += 12;
+    if (text.startsWith("=")) score += 30;
+    if (element !== host) score += 6;
+    if (rect.top >= 0 && rect.top <= 340) score += 12;
+    if (rect.width >= 120) score += 8;
+    if (text.length >= 4) score += 6;
+    return score;
+  }
+
+  function isFormulaReaderLabel(value) {
+    const text = String(value || "").trim();
+    return /^(?:fx|公式|公式栏|formula|formula bar)$/i.test(text);
+  }
+
+  function resolveFormulaElementAccessMode(element) {
+    if (!(element instanceof Element)) return "unknown";
+    if (isExplicitReadOnlyFormulaElement(element)) return "read-only";
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return "editable";
+    if (isContentEditableElement(element)) return "editable";
+    return "unknown";
+  }
+
+  function isExplicitReadOnlyFormulaElement(element) {
+    if (!(element instanceof Element)) return false;
+    let node = element;
+    let depth = 0;
+    while (node instanceof Element && depth < 5) {
+      if ((node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) && (node.readOnly || node.disabled)) return true;
+      if ((node.getAttribute("aria-readonly") || "").toLowerCase() === "true") return true;
+      if ((node.getAttribute("data-readonly") || "").toLowerCase() === "true") return true;
+      if ((node.getAttribute("data-read-only") || "").toLowerCase() === "true") return true;
+      if ((node.getAttribute("data-editable") || "").toLowerCase() === "false") return true;
+      const hint = `${node.className || ""} ${node.getAttribute("aria-label") || ""}`.toLowerCase();
+      if (/readonly|read-only|is-disabled|disabled/.test(hint)) return true;
+      if (FORMULA_SELECTORS.some((selector) => node.matches(selector))) break;
+      node = node.parentElement;
+      depth += 1;
+    }
+    return false;
   }
 
   function probeVisibleFormulaBarText(context) {
@@ -2489,7 +2764,7 @@
   }
 
   function refineFormulaCaptureEvaluation(session, sourceKey, text, evaluation) {
-    if (!session || sourceKey !== "formula" || !evaluation || evaluation.status !== "success") return evaluation;
+    if (!session || !String(sourceKey || "").startsWith("formula") || !evaluation || evaluation.status !== "success") return evaluation;
 
     const elapsed = elapsedMs(session);
     if (elapsed < FORMULA_CAPTURE_MIN_ACCEPT_MS) {
@@ -2550,6 +2825,7 @@
       cellAddress: normalizeCellAddress(cellAddress),
       sheetId: pageIdentity.sheetId,
       spreadsheetToken: pageIdentity.spreadsheetToken,
+      cellAccessMode: normalizeCellAccessMode(captureMeta && captureMeta.cellAccessMode),
       selectionConfirmed: Boolean(captureMeta && captureMeta.selectionConfirmed),
       captureOrigin: String(captureMeta && captureMeta.captureOrigin || "unspecified"),
       capturedAt: Number(captureMeta && captureMeta.capturedAt) || Date.now()
@@ -3821,6 +4097,7 @@
       source,
       pageTitle: document.title,
       pageUrl: location.href,
+      cellAccessMode: normalizeCellAccessMode(captureMeta && captureMeta.cellAccessMode),
       cellContext: cellContext || null,
       cellAddress: address,
       sheetId: pageIdentity.sheetId,
@@ -3833,6 +4110,7 @@
         sheetId: pageIdentity.sheetId,
         spreadsheetToken: pageIdentity.spreadsheetToken,
         fingerprint: buildTargetFingerprint(normalized, address),
+        cellAccessMode: normalizeCellAccessMode(captureMeta && captureMeta.cellAccessMode),
         selectionConfirmed: Boolean(captureMeta && captureMeta.selectionConfirmed && address),
         captureOrigin: String(captureMeta && captureMeta.captureOrigin || "unspecified"),
         capturedAt: Number(captureMeta && captureMeta.capturedAt) || Date.now()
@@ -3999,6 +4277,11 @@
     return normalizeWriteText(value) === "";
   }
 
+  function normalizeCellAccessMode(value) {
+    const mode = String(value || "").toLowerCase();
+    return ["editable", "read-only", "unknown"].includes(mode) ? mode : "unknown";
+  }
+
   function normalizeCellContext(context) {
     if (!context || typeof context !== "object") return null;
     const x = Number(context.x);
@@ -4059,13 +4342,24 @@
     return normalized.slice(0, 140);
   }
 
-  function safelyRunProbe(fn) {
+  function safelyRunCaptureProbe(fn) {
     try {
       const value = fn();
-      return typeof value === "string" ? value : "";
+      if (typeof value === "string") return { text: value, cellAccessMode: "unknown", details: null };
+      if (!value || typeof value !== "object") return { text: "", cellAccessMode: "unknown", details: null };
+      return {
+        text: typeof value.text === "string" ? value.text : "",
+        cellAccessMode: normalizeCellAccessMode(value.cellAccessMode),
+        details: value.details && typeof value.details === "object" ? value.details : null
+      };
     } catch (_) {
-      return "";
+      return { text: "", cellAccessMode: "unknown", details: null };
     }
+  }
+
+  function mergeCaptureProbeDetails(probeDetails, evaluationDetails) {
+    if (!probeDetails && !evaluationDetails) return null;
+    return { ...(probeDetails || {}), ...(evaluationDetails || {}) };
   }
 
   function getDeepActiveElement() {

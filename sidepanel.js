@@ -45,6 +45,7 @@
       cellContext: null,
       cellAddress: "",
       cellTarget: null,
+      cellAccessMode: "unknown",
       editing: false,
       editMode: "text",
       draft: "",
@@ -1488,6 +1489,7 @@
         tabUrl: message.tabUrl || "",
         pageUrl: message.pageUrl || "",
         sheetId: message.sheetId || "",
+        cellAccessMode: message.cellAccessMode || "unknown",
         spreadsheetToken: message.spreadsheetToken || "",
         targetSnapshot: message.targetSnapshot || null
       }
@@ -1597,6 +1599,7 @@
     pane.cellWindowId = toFiniteNumber(scope && scope.windowId);
     pane.cellFrameId = toFiniteNumber(scope && scope.frameId);
     pane.cellTarget = createCellTarget(text, cellContext, cellAddress, scope);
+    pane.cellAccessMode = normalizeCellAccessMode(pane.cellTarget && pane.cellTarget.cellAccessMode);
     updatePanelScope(scope);
     renderChrome();
     renderPane(paneIndex, { preserveScroll: false });
@@ -1606,6 +1609,10 @@
   function beginTypingMode(paneIndex) {
     const pane = state.panes[paneIndex];
     if (!pane) return;
+    if (normalizeCellAccessMode(pane.cellAccessMode) === "read-only") {
+      showToast("当前单元格为只读，无法键入");
+      return;
+    }
     const typingAnchor = captureTypingPosition(paneIndex);
     closeAllPaneSearch({ restoreFocus: false });
     const context = normalizePanelCellContext(pane.cellContext);
@@ -1685,6 +1692,10 @@
     const pane = state.panes[paneIndex];
     const candidate = pane && pane.relocationCandidate;
     if (!pane || !pane.editing || !candidate) return;
+    if (normalizeCellAccessMode(candidate.cellAccessMode) === "read-only") {
+      showToast("候选单元格为只读，无法设为写回目标");
+      return;
+    }
     pane.editTarget = cloneCellTarget(candidate);
     pane.editContext = normalizePanelCellContext(candidate.context);
     pane.editAddress = candidate.address || "";
@@ -1700,6 +1711,10 @@
   async function completeTypingMode(paneIndex) {
     const pane = state.panes[paneIndex];
     if (!pane || !pane.editing || pane.writing) return;
+    if (normalizeCellAccessMode(pane.editTarget && pane.editTarget.cellAccessMode) === "read-only") {
+      showToast("当前写回目标为只读，无法完成键入");
+      return;
+    }
     if (pane.confirmDiscard) {
       showToast("请先处理放弃草稿确认");
       return;
@@ -1837,6 +1852,7 @@
     pane.cellTabId = resolvedTarget.tabId || pane.editTabId || pane.cellTabId;
     pane.cellWindowId = resolvedTarget.windowId || pane.editWindowId || pane.cellWindowId;
     pane.cellFrameId = resolvedTarget.frameId == null ? pane.editFrameId : resolvedTarget.frameId;
+    pane.cellAccessMode = normalizeCellAccessMode(resolvedTarget.cellAccessMode);
     rememberWriteEcho(pane, resolvedTarget, pane.draft);
     exitTypingMode(paneIndex);
     renderPane(paneIndex, { preserveScroll: false });
@@ -2006,8 +2022,11 @@
     lockBtn.setAttribute("aria-label", pane.locked ? "解除锁定当前分栏" : "锁定当前分栏");
     lockBtn.setAttribute("aria-pressed", String(Boolean(pane.locked)));
     if (typeBtn) {
+      const isReadOnly = normalizeCellAccessMode(pane.cellAccessMode) === "read-only";
       typeBtn.classList.toggle("fz-active", pane.editing);
-      typeBtn.disabled = pane.writing;
+      typeBtn.disabled = pane.writing || isReadOnly;
+      typeBtn.dataset.tooltip = isReadOnly ? "当前单元格只读" : "键入";
+      typeBtn.setAttribute("aria-label", isReadOnly ? "当前单元格为只读" : "键入当前单元格内容");
       typeBtn.setAttribute("aria-pressed", String(Boolean(pane.editing)));
     }
 
@@ -2265,6 +2284,11 @@
     return match ? `${match[1]}${match[2]}` : "";
   }
 
+  function normalizeCellAccessMode(value) {
+    const mode = String(value || "").toLowerCase();
+    return ["editable", "read-only", "unknown"].includes(mode) ? mode : "unknown";
+  }
+
   function createCellTarget(text, cellContext, cellAddress, scope) {
     const snapshot = scope && scope.targetSnapshot && typeof scope.targetSnapshot === "object"
       ? scope.targetSnapshot
@@ -2283,6 +2307,7 @@
       sheetId: String(snapshot.sheetId || (scope && scope.sheetId) || extractSheetIdFromUrl(pageUrl) || extractSheetIdFromUrl(tabUrl)),
       spreadsheetToken: String(snapshot.spreadsheetToken || (scope && scope.spreadsheetToken) || extractSpreadsheetToken(pageUrl) || extractSpreadsheetToken(tabUrl)),
       fingerprint: normalizeTargetFingerprint(snapshot.fingerprint),
+      cellAccessMode: normalizeCellAccessMode(snapshot.cellAccessMode || (scope && scope.cellAccessMode)),
       selectionConfirmed: Boolean(snapshot.selectionConfirmed),
       captureOrigin: String(snapshot.captureOrigin || "unspecified"),
       capturedAt: Number(snapshot.capturedAt) || 0
@@ -2366,7 +2391,7 @@
     if (selected === "md") return "md";
     const source = String(rawText == null ? "" : rawText);
     if (parseJson(source.trim()).ok || parseJson(normalizeDisplayText(source).trim()).ok) return "json";
-    return "md";
+    return detectContentKind(normalizeDisplayText(source));
   }
 
   function formatJsonDraft(text) {
@@ -2793,6 +2818,10 @@
   function detectContentKind(text) {
     const trimmed = text.trim();
     if (parseJson(trimmed).ok) return "json";
+    // A leading equals sign identifies spreadsheet formula source for display.
+    // This is deliberately not a completeness check: capture is responsible for
+    // supplying a structurally complete value before the panel receives it.
+    if (String(text == null ? "" : text).trimStart().startsWith("=")) return "raw";
     return "md";
   }
 
