@@ -30,5 +30,3 @@ CellPeek 是一款面向飞书 / Lark 电子表格的 Chrome 扩展。点击表�
 ## 支持范围
 
 CellPeek 支持飞书和 Lark 网页版电子表格，包括 `feishu.cn`、`larksuite.com` 和 `larkoffice.com` 相关域名。建议使用当前稳定版 Chrome。
-
-部分租户或页面版本可能存在界面差异。当 CellPeek 无法可靠确认目标单元格时，会优先保护数据，不执行猜测写回。
