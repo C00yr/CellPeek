@@ -10,7 +10,7 @@
   <body>
     <main class="fz-shell">
       <header class="fz-toolbar">
-        <div class="fz-title">CellPeek</div>
+        <div class="fz-title">单元格详情</div>
         <div class="fz-layout-switch" role="group" aria-label="分栏布局">
           <button class="fz-btn fz-layout-btn fz-active" data-action="split-single" data-tooltip="单栏" aria-label="切换为单栏">
             <svg class="fz-layout-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
@@ -62,7 +62,7 @@
           </div>
           <div class="fz-cell-meta" aria-label="单元格信息">
             <div class="fz-cell-meta-left">
-              <span class="fz-cell-address"></span>
+              <button class="fz-cell-address" type="button" data-action="reveal-cell" aria-label="定位到当前单元格" disabled></button>
               <button class="fz-search-trigger" data-action="toggle-search" data-tooltip="查询" aria-label="查询当前展示内容" aria-expanded="false" aria-controls="pane-search-0">
                 <svg class="fz-search-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="4.25"></circle><path d="m11.75 11.75 3 3"></path></svg>
               </button>
@@ -116,7 +116,7 @@
           </div>
           <div class="fz-cell-meta" aria-label="单元格信息">
             <div class="fz-cell-meta-left">
-              <span class="fz-cell-address"></span>
+              <button class="fz-cell-address" type="button" data-action="reveal-cell" aria-label="定位到当前单元格" disabled></button>
               <button class="fz-search-trigger" data-action="toggle-search" data-tooltip="查询" aria-label="查询当前展示内容" aria-expanded="false" aria-controls="pane-search-1">
                 <svg class="fz-search-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="4.25"></circle><path d="m11.75 11.75 3 3"></path></svg>
               </button>
@@ -140,7 +140,8 @@
         </article>
       </section>
 
-      <section class="fz-debug">
+      <!-- Maintenance debug UI: remove `hidden` to restore the diagnostics panel. -->
+      <section class="fz-debug" hidden>
         <button class="fz-debug-toggle" data-action="toggle-debug" aria-expanded="false">
           <span class="fz-debug-toggle-label">
             <svg class="fz-debug-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="2"></rect><path d="m6 7 2.5 3L6 13"></path><path d="M10.5 13H14"></path></svg>

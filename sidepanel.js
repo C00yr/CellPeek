@@ -46,6 +46,8 @@
       cellAddress: "",
       cellTarget: null,
       cellAccessMode: "unknown",
+      revealing: false,
+      revealSelectionGuard: null,
       editing: false,
       editMode: "text",
       draft: "",
@@ -158,6 +160,12 @@
 
     if (action !== "type" && action !== "json-toggle" && action !== "json-copy-member") {
       closeAllPaneSearch({ restoreFocus: false });
+    }
+    if (action === "reveal-cell") {
+      const revealPaneEl = actionBtn.closest(".fz-pane");
+      if (!revealPaneEl) return;
+      revealPaneCell(Number(revealPaneEl.dataset.pane));
+      return;
     }
     if (action === "toggle-mode-menu") {
       const modePaneEl = actionBtn.closest(".fz-pane");
@@ -1460,15 +1468,117 @@
 
     try {
       await navigator.clipboard.writeText(String(text));
-      showToast("已复制展示内容");
+      showToast("已复制");
     } catch (_) {
       showToast("复制失败，请检查浏览器剪贴板权限");
     }
   }
 
+  function canRevealPaneCell(pane) {
+    if (!pane || pane.revealing || pane.writing) return false;
+    if (pane.editing && ["waiting", "confirming"].includes(pane.relocationStatus)) return false;
+    const target = pane.cellTarget;
+    const address = normalizeCellAddress(pane.cellAddress || target && target.address);
+    const tabId = toFiniteNumber(target && target.tabId != null ? target.tabId : pane.cellTabId);
+    return Boolean(target && address && tabId);
+  }
+
+  async function revealPaneCell(paneIndex) {
+    const pane = state.panes[paneIndex];
+    const paneEl = document.querySelector(`[data-pane="${paneIndex}"]`);
+    if (!pane || !paneEl || !canRevealPaneCell(pane)) return;
+
+    state.activePane = paneIndex;
+    renderChrome();
+
+    const target = cloneCellTarget(pane.cellTarget);
+    target.address = normalizeCellAddress(pane.cellAddress || target.address);
+    target.tabId = toFiniteNumber(target.tabId != null ? target.tabId : pane.cellTabId);
+    target.windowId = toFiniteNumber(target.windowId != null ? target.windowId : pane.cellWindowId);
+    target.frameId = toFiniteNumber(target.frameId != null ? target.frameId : pane.cellFrameId);
+
+    pane.revealing = true;
+    pane.revealSelectionGuard = {
+      expiresAt: Date.now() + 5000,
+      address: target.address,
+      tabId: target.tabId,
+      sheetId: String(target.sheetId || ""),
+      spreadsheetToken: String(target.spreadsheetToken || "")
+    };
+    updatePaneMeta(paneEl, pane);
+
+    const response = await new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({
+          type: "FZ_REVEAL_CELL",
+          tabId: target.tabId,
+          windowId: target.windowId,
+          frameId: target.frameId,
+          cellAddress: target.address,
+          targetSnapshot: target
+        }, (value) => {
+          if (chrome.runtime.lastError) {
+            resolve({ ok: false, reason: "REVEAL_MESSAGE_FAILED" });
+            return;
+          }
+          resolve(value || { ok: false, reason: "REVEAL_EMPTY_RESPONSE" });
+        });
+      } catch (_) {
+        resolve({ ok: false, reason: "REVEAL_MESSAGE_FAILED" });
+      }
+    });
+
+    pane.revealing = false;
+    if (!response || !response.ok) {
+      if (pane.revealSelectionGuard) pane.revealSelectionGuard.expiresAt = Date.now() + 900;
+      showToast(formatRevealCellFailure(response && response.reason, target.address));
+    }
+    updatePaneMeta(paneEl, pane);
+  }
+
+  function formatRevealCellFailure(reason, address) {
+    switch (String(reason || "")) {
+      case "SOURCE_TAB_UNAVAILABLE": return "来源标签页已关闭";
+      case "SOURCE_TAB_NAVIGATED": return "来源标签页已跳转";
+      case "SOURCE_SHEET_UNAVAILABLE": return "来源工作表不可用";
+      case "CONTENT_SCRIPT_NOT_READY": return "表格页面尚未准备好";
+      case "INVALID_TARGET_ADDRESS":
+      case "invalid_target_address": return "单元格地址无效";
+      case "address_control_not_found": return "未找到飞书地址定位框";
+      case "address_control_not_editable": return "飞书地址定位框不可用";
+      default: return `无法定位到 ${address || "该单元格"}`;
+    }
+  }
+
+  function isRecentRevealSelectionEcho(message) {
+    const now = Date.now();
+    const messageAddress = normalizeCellAddress(message && message.cellAddress);
+    const messageTabId = toFiniteNumber(message && message.tabId);
+    const messageSheetId = String(message && message.sheetId || "");
+    const messageSpreadsheetToken = String(message && message.spreadsheetToken || "");
+
+    return state.panes.some((pane) => {
+      const guard = pane && pane.revealSelectionGuard;
+      if (!guard) return false;
+      if (guard.expiresAt <= now) {
+        pane.revealSelectionGuard = null;
+        return false;
+      }
+      if (!guard.address || guard.address !== messageAddress) return false;
+      if (guard.tabId && messageTabId && guard.tabId !== messageTabId) return false;
+      if (guard.sheetId && messageSheetId && guard.sheetId !== messageSheetId) return false;
+      if (guard.spreadsheetToken && messageSpreadsheetToken &&
+        guard.spreadsheetToken !== messageSpreadsheetToken) return false;
+      return true;
+    });
+  }
   function handleCellSelection(message) {
     if (state.panes.some((pane) => pane && pane.writing)) return;
     if (isRecentWriteEcho(message)) return;
+    if (isRecentRevealSelectionEcho(message)) return;
+    state.panes.forEach((pane) => {
+      if (pane) pane.revealSelectionGuard = null;
+    });
     closeAllPaneSearch({ restoreFocus: false });
 
     const relocationPaneIndex = findRelocationPaneIndex(message);
@@ -1978,7 +2088,7 @@
   function renderChrome() {
     panesEl.className = `fz-panes fz-${state.split === "single" ? "single" : `split-${state.split}`}`;
     state.splitRatio = clampSplitRatio(state.splitRatio);
-    titleEl.textContent = state.split === "single" ? "CellPeek" : `分栏 ${state.activePane + 1}`;
+    titleEl.textContent = state.split === "single" ? "单元格详情" : `分栏 ${state.activePane + 1}`;
     panesEl.style.setProperty("--split-a", `${state.splitRatio}fr`);
     panesEl.style.setProperty("--split-b", `${100 - state.splitRatio}fr`);
 
@@ -2088,7 +2198,18 @@
     const countEl = paneEl.querySelector(".fz-cell-count");
     const displayText = pane.editing ? pane.draft : pane.text;
     const countSource = pane.editing ? displayText : normalizeDisplayText(displayText || "");
-    if (addressEl) addressEl.textContent = pane.cellAddress || "";
+    if (addressEl) {
+      const address = normalizeCellAddress(
+        pane.cellAddress || pane.cellTarget && pane.cellTarget.address
+      );
+      const available = canRevealPaneCell(pane);
+      addressEl.textContent = address;
+      addressEl.disabled = !available;
+      addressEl.dataset.tooltip = available ? `定位到 ${address}` : "";
+      addressEl.setAttribute("aria-label", address ? `定位到 ${address}` : "暂无可定位单元格");
+      addressEl.setAttribute("aria-busy", String(Boolean(pane.revealing)));
+      addressEl.classList.toggle("fz-revealing", Boolean(pane.revealing));
+    }
     if (countEl) countEl.textContent = `${countCellText(countSource || "")} 字`;
   }
 
@@ -2650,7 +2771,7 @@
     }
     try {
       await navigator.clipboard.writeText(text);
-      showToast("已复制 JSON 成员");
+      showToast("已复制");
     } catch (_) {
       showToast("复制失败，请检查浏览器剪贴板权限");
     }

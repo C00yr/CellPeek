@@ -5,6 +5,7 @@ const cellFrameHintsByTab = new Map();
 const AUTO_CAPTURE_DELAY_MS = 60;
 const INJECT_DEBOUNCE_MS = 300;
 const injectedAtByTab = new Map();
+const autoCaptureSuppressedUntilByTab = new Map();
 
 if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
@@ -67,6 +68,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   lastFeishuFrameIdByTab.delete(tabId);
   cellFrameHintsByTab.delete(tabId);
   injectedAtByTab.delete(tabId);
+  autoCaptureSuppressedUntilByTab.delete(tabId);
   if (lastFeishuTabId === tabId) lastFeishuTabId = null;
   for (const [windowId, rememberedTabId] of lastFeishuTabIdByWindow.entries()) {
     if (rememberedTabId === tabId) lastFeishuTabIdByWindow.delete(windowId);
@@ -76,6 +78,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return;
   if (message.fzRouted) return;
+
+  if (message.type === "FZ_REVEAL_CELL") {
+    forwardRevealCell(message).then(sendResponse).catch((error) => {
+      sendResponse({ ok: false, reason: error && error.message ? error.message : "REVEAL_FORWARD_FAILED" });
+    });
+    return true;
+  }
 
   if (message.type === "FZ_WRITE_CELL") {
     forwardWriteCell(message).then(sendResponse).catch((error) => {
@@ -110,6 +119,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+async function forwardRevealCell(message) {
+  const tabId = resolveWriteTabId(message);
+  if (typeof tabId !== "number") return { ok: false, reason: "NO_FEISHU_TAB" };
+  const target = message && message.targetSnapshot && typeof message.targetSnapshot === "object"
+    ? message.targetSnapshot
+    : {};
+  const address = normalizeCellAddress(message && message.cellAddress || target.address);
+  if (!address) return { ok: false, reason: "INVALID_TARGET_ADDRESS" };
+
+  suppressAutoCapture(tabId, 20000);
+  try {
+    const activation = await activateSourceTab(tabId, target);
+    if (!activation.ok) return activation;
+
+    const injected = await ensureContentScript(tabId, { force: Boolean(activation.navigated) });
+    if (!injected) return { ok: false, reason: "CONTENT_SCRIPT_NOT_READY" };
+    const discoveredFrameId = await discoverWriteFrameId(tabId, target);
+    const frameId = typeof discoveredFrameId === "number"
+      ? discoveredFrameId
+      : resolveWriteFrameId(tabId, message);
+    const options = typeof frameId === "number" ? { frameId } : undefined;
+    try {
+      return await chrome.tabs.sendMessage(tabId, {
+        ...message,
+        type: "FZ_REVEAL_CELL",
+        cellAddress: address,
+        sourceTabActivated: true,
+        sourceTabUrl: activation.tabUrl || ""
+      }, options);
+    } catch (error) {
+      return { ok: false, reason: error && error.message ? error.message : "REVEAL_MESSAGE_FAILED" };
+    }
+  } finally {
+    autoCaptureSuppressedUntilByTab.delete(tabId);
+    suppressAutoCapture(tabId, 1500);
+  }
+}
 async function forwardWriteCell(message) {
   const tabId = resolveWriteTabId(message);
   if (typeof tabId !== "number") return { ok: false, reason: "NO_FEISHU_TAB" };
@@ -429,9 +475,27 @@ async function ensureContentScript(tabId, options = {}) {
   }
 }
 
-function requestCurrentCellCapture(tabId) {
+function suppressAutoCapture(tabId, durationMs) {
   if (typeof tabId !== "number") return;
+  const until = Date.now() + Math.max(0, Number(durationMs) || 0);
+  const current = autoCaptureSuppressedUntilByTab.get(tabId) || 0;
+  autoCaptureSuppressedUntilByTab.set(tabId, Math.max(current, until));
+}
+
+function isAutoCaptureSuppressed(tabId) {
+  const until = autoCaptureSuppressedUntilByTab.get(tabId) || 0;
+  if (!until) return false;
+  if (until <= Date.now()) {
+    autoCaptureSuppressedUntilByTab.delete(tabId);
+    return false;
+  }
+  return true;
+}
+
+function requestCurrentCellCapture(tabId) {
+  if (typeof tabId !== "number" || isAutoCaptureSuppressed(tabId)) return;
   setTimeout(() => {
+    if (isAutoCaptureSuppressed(tabId)) return;
     const result = chrome.tabs.sendMessage(tabId, { type: "FZ_CAPTURE_CURRENT_CELL" });
     if (result && typeof result.catch === "function") result.catch(() => {});
   }, AUTO_CAPTURE_DELAY_MS);

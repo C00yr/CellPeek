@@ -97,6 +97,15 @@
     if (message.type === "FZ_CAPTURE_CURRENT_CELL") {
       captureCurrentActiveCell();
     }
+    if (message.type === "FZ_REVEAL_CELL") {
+      revealCellFromPanel(message).then(sendResponse).catch((error) => {
+        sendResponse({
+          ok: false,
+          reason: error && error.message ? error.message : "REVEAL_CELL_FAILED"
+        });
+      });
+      return true;
+    }
     if (message.type === "FZ_WRITE_CELL") {
       writeCellFromPanelDetailed(message).then(sendResponse).catch((error) => {
         sendResponse({
@@ -108,6 +117,29 @@
     }
   });
 
+  async function revealCellFromPanel(message) {
+    const target = message && message.targetSnapshot && typeof message.targetSnapshot === "object"
+      ? message.targetSnapshot
+      : {};
+    const address = normalizeCellAddress(message && message.cellAddress || target.address);
+    if (!address) return { ok: false, reason: "INVALID_TARGET_ADDRESS" };
+
+    const navigation = await navigateToCellAddress(address);
+    if (!navigation || !navigation.ok) {
+      return {
+        ok: false,
+        reason: navigation && navigation.reason ? navigation.reason : "ADDRESS_NAVIGATION_FAILED",
+        navigation: navigation || null
+      };
+    }
+    await sleep(80);
+    return {
+      ok: true,
+      reason: "address_revealed",
+      cellAddress: address,
+      navigation
+    };
+  }
   function startCaptureSession(target, event, context, options) {
     cancelSession();
     const session = {

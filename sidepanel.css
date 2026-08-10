@@ -543,7 +543,35 @@ button { font-family: inherit; }
 }
 
 .fz-cell-address {
+  border: 0;
+  outline: none;
+  pointer-events: auto;
   color: var(--fz-primary);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 100ms ease, opacity 140ms ease;
+}
+
+.fz-cell-address:hover:not(:disabled) {
+  background: #e8efff;
+  color: #0c4ddb;
+}
+
+.fz-cell-address:active:not(:disabled) {
+  transform: translateY(1px);
+  background: #dfe9ff;
+}
+
+.fz-cell-address:focus-visible {
+  box-shadow: 0 0 0 2px rgba(51, 102, 255, 0.2);
+}
+
+.fz-cell-address:disabled {
+  cursor: default;
+}
+
+.fz-cell-address.fz-revealing {
+  opacity: 0.62;
 }
 
 .fz-cell-address:empty {
@@ -1293,6 +1321,11 @@ mark.fz-search-hit.fz-search-hit-current {
 .fz-toast.fz-show {
   opacity: 1;
   transform: translate(-50%, 0);
+}
+
+/* Maintenance UI is retained but intentionally removed from the product layout. */
+.fz-debug[hidden] {
+  display: none;
 }
 
 .fz-debug {
