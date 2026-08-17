@@ -11,8 +11,8 @@
   const MAX_SEARCH_DEPTH = 10;
   const KEYBOARD_CAPTURE_DELAY_MS = 80;
   const FORMULA_CAPTURE_MIN_ACCEPT_MS = 200;
-  const FORMULA_SAME_TEXT_SETTLE_MS = 650;
-  const AUTO_EMPTY_CAPTURE_MIN_STABLE_MS = 200;
+  const EXACT_FORMULA_CAPTURE_MIN_ACCEPT_MS = 100;
+  const AUTO_EMPTY_CAPTURE_MIN_STABLE_MS = 500;
   const AUTO_EMPTY_CAPTURE_REQUIRED_HITS = 3;
   const TARGET_NAVIGATION_CHECKPOINT_DELAYS_MS = [50, 70, 120, 210, 400];
   const TARGET_NAVIGATION_MIN_STABLE_MS = 240;
@@ -20,7 +20,12 @@
 
   const CELL_SELECTOR = "[role='gridcell'], [data-cell], [data-cell-id], td, th";
   const EDITOR_SELECTOR = "[contenteditable]:not([contenteditable='false']),textarea,input[type='text'],input:not([type]),[role='textbox']";
+  const FEISHU_FORMULA_BAR_SELECTOR = "#t-formula-bar-input-container";
+  const FEISHU_SELECTION_VALUE_SELECTOR = ".gcsj-func-normal-text";
+
+  const FEISHU_NAME_BOX_SELECTOR = "#t-name-box";
   const FORMULA_SELECTORS = [
+    FEISHU_FORMULA_BAR_SELECTOR,
     "[data-testid*='formula' i]",
     "[class*='formula' i]",
     "[class*='fx' i]",
@@ -28,19 +33,6 @@
     "[aria-label*='fx' i]",
     "[placeholder*='公式' i]",
     "[placeholder*='fx' i]"
-  ];
-  const READ_ONLY_FORMULA_VALUE_SELECTORS = [
-    "[aria-readonly='true']",
-    "[data-readonly='true']",
-    "[data-read-only='true']",
-    "[data-editable='false']",
-    "[aria-valuetext]",
-    "[data-cell-value]",
-    "[data-raw-value]",
-    "[data-value]",
-    "[class*='readonly' i]",
-    "[class*='read-only' i]",
-    "[role='textbox']"
   ];
   const ACTIVE_CELL_SELECTORS = [
     "[aria-selected='true']",
@@ -142,6 +134,7 @@
   }
   function startCaptureSession(target, event, context, options) {
     cancelSession();
+    const initialCellAddress = normalizeCellAddress(options && options.initialCellAddress);
     const session = {
       id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       url: location.href,
@@ -149,9 +142,9 @@
       startedMs: performance.now(),
       clickTarget: describeClickTarget(target, event),
       clickContext: context || null,
-      cellAddress: normalizeCellAddress(options && options.initialCellAddress) || resolveCellAddress(target, context),
-      addressEvidenceLocked: Boolean(options && options.requireStableAddressEvidence) || Boolean(normalizeCellAddress(options && options.initialCellAddress)),
-      addressEvidenceHits: normalizeCellAddress(options && options.initialCellAddress) ? 1 : 0,
+      cellAddress: initialCellAddress || resolveCellAddress(target, context),
+      addressEvidenceLocked: Boolean(options && options.requireStableAddressEvidence) || Boolean(initialCellAddress),
+      addressEvidenceHits: initialCellAddress ? 1 : 0,
       attempts: [],
       emptyLikelyHits: 0,
       stableEmptyHits: 0,
@@ -174,10 +167,6 @@
         emitStableEmptyCapture(session, "当前空单元格");
         return;
       }
-      if (session.sawStalePreviousFormula) {
-        finalizeSession(session, "success", "公式栏同步未完成");
-        return;
-      }
       if (!session.suppressEmpty && !session.allowStableEmpty) {
         emitCellSelected("", "空单元格", session.clickContext, session.cellAddress);
       }
@@ -197,18 +186,30 @@
       if (freshAddress) session.cellAddress = freshAddress;
     }
 
-    const probes = [
-      { key: "formula_editable", source: "公式栏输入区", run: probeFormulaEditorCapture },
-      { key: "formula_readonly", source: "公式栏只读值", run: probeReadOnlyFormulaBarCapture }
-    ];
+    // Content and access are independent: the exact selection-value node is
+    // authoritative for content, while the editor only determines whether the
+    // selected cell can be edited.
+    const exactFormulaSnapshot = probeExactFeishuFormulaBarCapture();
+    const exactReaderReady = Boolean(
+      exactFormulaSnapshot && exactFormulaSnapshot.details && exactFormulaSnapshot.details.readerReady
+    );
+    const editableFormulaSnapshot = exactReaderReady
+      ? null
+      : probeFormulaEditorCapture();
+    const probes = exactReaderReady
+      ? [{ key: "formula_exact", source: "当前选区值源", run: () => exactFormulaSnapshot }]
+      : [{ key: "formula_editable", source: "公式栏输入区", run: () => editableFormulaSnapshot }];
 
     let stepFormulaEmpty = false;
     let stepFormulaConfirmedEmpty = false;
 
     for (const probe of probes) {
       const probeResult = safelyRunCaptureProbe(probe.run);
+      if (probeResult.details && probeResult.details.readerReady) {
+        session.cellAccessMode = normalizeCellAccessMode(probeResult.cellAccessMode);
+      }
       const text = normalizeCellText(probeResult.text);
-      const baseEvaluation = evaluateCandidate(text, probe.key, session.cellAddress);
+      const baseEvaluation = evaluateCandidate(probe.key, Boolean(probeResult.details && probeResult.details.readerReady));
       const evaluation = refineFormulaCaptureEvaluation(session, probe.key, text, baseEvaluation);
 
       pushAttempt(session, {
@@ -239,12 +240,17 @@
       }
 
       if (evaluation.status !== "success") continue;
-      if (!isCaptureAddressConfirmed(session)) continue;
 
       session.cellAccessMode = normalizeCellAccessMode(probeResult.cellAccessMode);
       const captureMeta = createCaptureSnapshotMeta(session);
       rememberCaptureResult(text, session.cellAddress, captureMeta);
-      emitCellSelected(text, probe.source, session.clickContext, session.cellAddress, captureMeta);
+      session.emittedSelection = emitCellSelected(
+        text,
+        probe.source,
+        session.clickContext,
+        session.cellAddress,
+        captureMeta
+      );
       finalizeSession(session, "success", probe.source);
       return;
     }
@@ -274,7 +280,7 @@
 
   function updateStableEmptyCaptureEvidence(session, confirmedEmpty) {
     const address = normalizeCellAddress(session && session.cellAddress);
-    if (!session || !confirmedEmpty || !address) {
+    if (!session || !confirmedEmpty) {
       if (session) {
         session.stableEmptyHits = 0;
         session.stableEmptyAddress = "";
@@ -312,8 +318,6 @@
     return Boolean(
       session &&
       session.allowStableEmpty &&
-      isCaptureAddressConfirmed(session) &&
-      normalizeCellAddress(session.stableEmptyAddress) &&
       session.stableEmptyHits >= AUTO_EMPTY_CAPTURE_REQUIRED_HITS &&
       elapsedMs(session) >= AUTO_EMPTY_CAPTURE_MIN_STABLE_MS
     );
@@ -323,7 +327,13 @@
     if (!isSessionActive(session)) return;
     const captureMeta = createCaptureSnapshotMeta(session);
     rememberCaptureResult("", session.stableEmptyAddress, captureMeta);
-    emitCellSelected("", source, session.clickContext, session.stableEmptyAddress, captureMeta);
+    session.emittedSelection = emitCellSelected(
+      "",
+      source,
+      session.clickContext,
+      session.stableEmptyAddress,
+      captureMeta
+    );
     finalizeSession(session, "success", source);
   }
 
@@ -337,14 +347,47 @@
   }
 
   function readVisibleCellAddressEvidence(context) {
-    const display = findCellAddressDisplay();
-    if (display instanceof Element) {
-      const exactAddress = collectAddressCandidateTexts(display)
+    return readVisibleCellAddressEvidenceDetailed(context).address;
+  }
+
+  function readVisibleCellAddressEvidenceDetailed(context) {
+    const exactAddress = readExactFeishuFormulaAddress();
+    if (exactAddress) {
+      const exactElement = Array.from(document.querySelectorAll(FEISHU_NAME_BOX_SELECTOR))
+        .find((element) => element instanceof Element && isVisibleElement(element)) || null;
+      return {
+        address: exactAddress,
+        source: "feishu_name_box_selector",
+        element: exactElement
+      };
+    }
+
+    const control = findCellAddressControl();
+    if (control instanceof Element) {
+      const controlAddress = collectAddressCandidateTexts(control)
         .map((value) => normalizeExactCellAddress(value))
         .find(Boolean);
-      if (exactAddress) return exactAddress;
+      if (controlAddress) {
+        return {
+          address: controlAddress,
+          source: "formula_adjacent_address_control",
+          element: control
+        };
+      }
     }
-    return normalizeCellAddress(findCellAddressFromVisibleUi(context));
+
+    const display = findCellAddressDisplay();
+    if (!(display instanceof Element)) {
+      return { address: "", source: "unavailable", element: null };
+    }
+    const displayAddress = collectAddressCandidateTexts(display)
+      .map((value) => normalizeExactCellAddress(value))
+      .find(Boolean) || "";
+    return {
+      address: displayAddress,
+      source: displayAddress ? "name_box_display" : "unavailable",
+      element: displayAddress ? display : null
+    };
   }
 
   function captureCurrentActiveCell() {
@@ -521,6 +564,9 @@
       return {
         ok: false,
         reason: logicalTarget.reason || "TARGET_NOT_FOUND",
+        address: logicalTarget.address || normalizeCellAddress(message && message.cellAddress),
+        observedText: logicalTarget.observedText || "",
+        targetSnapshot: logicalTarget.targetSnapshot || null,
         targetResolution: logicalTarget,
         debugSessionId: debugSession.id
       };
@@ -621,14 +667,36 @@
       details: writeDispatch
     });
 
-    const verification = await verifyCurrentSelectionWrite(
-      logicalTarget.address,
-      text,
-      observation
+    const dispatchObservedText = normalizeCellText(
+      writeDispatch && typeof writeDispatch.observedFormula === "string"
+        ? writeDispatch.observedFormula
+        : ""
     );
+    const dispatchConfirmed = Boolean(
+      writeDispatch &&
+      writeDispatch.ok &&
+      dispatchObservedText === normalizeCellText(text)
+    );
+    const verification = dispatchConfirmed
+      ? {
+        ok: true,
+        reason: "write_dispatch_content_matches_draft",
+        address: logicalTarget.address,
+        observedAddress: readVisibleCellAddressEvidence(),
+        addressEvidenceSource: "feishu_name_box_debug_only",
+        context,
+        text: dispatchObservedText,
+        selectionVerified: true,
+        stableHits: 1,
+        checks: []
+      }
+      : await verifyCurrentSelectionWrite(
+        logicalTarget.address,
+        text,
+        observation
+      );
     const writePersisted = Boolean(
       verification.ok &&
-      verification.selectionVerified &&
       normalizeCellText(verification.text) === normalizeCellText(text)
     );
     pushWriteAttempt(debugSession, {
@@ -1028,97 +1096,34 @@
         ? message.expectedText
         : target.text
     );
-    const original = await navigateAndObserveCell(target.address, expectedText);
+    const original = await navigateAndObserveCell(target.address);
     if (!original.ok) {
       return {
         ok: false,
-        reason: "TARGET_NOT_FOUND",
+        reason: "TARGET_SELECTION_UNVERIFIED",
         address: target.address,
         details: original
       };
     }
 
-    const fingerprintThreshold = getFingerprintMatchThreshold(target.fingerprint);
-    const originalFingerprintScore = scoreTargetFingerprint(target.fingerprint, original.fingerprint);
     const originalTextMatches = normalizeCellText(original.text) === expectedText;
-    if (originalTextMatches) {
-      return {
-        ok: true,
-        reason: "original_address_verified",
-        address: original.address || target.address,
-        context: original.context,
-        observation: original,
-        target
-      };
-    }
-
-    if (fingerprintThreshold === 0) {
+    if (!originalTextMatches && !(message && message.relocationConfirmed)) {
       return {
         ok: false,
-        reason: "WRITE_CONFLICT",
+        reason: "CONTENT_CHANGED",
         address: target.address,
-        observedText: original.text
+        observedText: original.text,
+        targetSnapshot: target
       };
     }
 
-    const nearbyAddresses = buildNearbyCellAddresses(target.address, MAX_TARGET_SCAN_CANDIDATES);
-    const matches = [];
-    for (const address of nearbyAddresses) {
-      const observation = await navigateAndObserveCell(address, expectedText);
-      if (!observation.ok) continue;
-      if (normalizeCellText(observation.text) !== expectedText) continue;
-      matches.push({
-        ...observation,
-        fingerprintScore: scoreTargetFingerprint(target.fingerprint, observation.fingerprint)
-      });
-    }
-
-    if (matches.length === 1 && matches[0].fingerprintScore >= fingerprintThreshold) {
-      return {
-        ok: true,
-        reason: "logical_cell_moved_nearby",
-        address: matches[0].address,
-        context: matches[0].context,
-        observation: matches[0],
-        target
-      };
-    }
-
-    if (matches.length > 1) {
-      matches.sort((a, b) => b.fingerprintScore - a.fingerprintScore);
-      const best = matches[0];
-      const runnerUp = matches[1];
-      if (best.fingerprintScore >= fingerprintThreshold && best.fingerprintScore > runnerUp.fingerprintScore) {
-        return {
-          ok: true,
-          reason: "logical_cell_moved_fingerprint_match",
-          address: best.address,
-          context: best.context,
-          observation: best,
-          target
-        };
-      }
-      await navigateAndObserveCell(target.address, expectedText);
-      return {
-        ok: false,
-        reason: "TARGET_MISMATCH",
-        candidateCount: matches.length
-      };
-    }
-
-    await navigateAndObserveCell(target.address, expectedText);
-    if (originalFingerprintScore >= fingerprintThreshold && !originalTextMatches) {
-      return {
-        ok: false,
-        reason: "WRITE_CONFLICT",
-        address: target.address,
-        observedText: original.text
-      };
-    }
     return {
-      ok: false,
-      reason: "TARGET_MISMATCH",
-      address: target.address
+      ok: true,
+      reason: originalTextMatches ? "original_address_verified" : "relocation_confirmed",
+      address: original.address || target.address,
+      context: original.context,
+      observation: original,
+      target
     };
   }
 
@@ -1202,23 +1207,14 @@
 
       const activeCell = findCurrentActiveCellElement();
       const activeCellAddress = normalizeCellAddress(extractCellAddressFromElement(activeCell));
-      const addressEcho = normalizeCellAddress(findCellAddressFromVisibleUi(null));
-      const addressEvidence = resolveAddressEvidence(normalizedAddress, activeCellAddress, addressEcho);
-      const observedAddress = addressEvidence.observedAddress;
-      const hasExplicitAddress = addressEvidence.available;
-      const addressConsistent = hasExplicitAddress
-        ? addressEvidence.verified
-        : Boolean(preWriteObservation && preWriteObservation.selectionVerified);
+      const addressEcho = readVisibleCellAddressEvidence();
       const formulaEditor = findBestFormulaEditor();
       const observedFormula = normalizeCellText(formulaEditor ? extractEditableText(formulaEditor) : "");
-      const sheetCanvas = document.querySelector("canvas.faster-single-canvas");
       const formulaMatches = observedFormula === normalizedTarget;
       const matched = Boolean(
-        addressConsistent &&
         formulaMatches &&
         formulaEditor instanceof Element &&
-        isVisibleElement(formulaEditor) &&
-        sheetCanvas
+        isVisibleElement(formulaEditor)
       );
       stableHits = matched ? stableHits + 1 : 0;
       const context = getElementCenterContext(activeCell) ||
@@ -1227,18 +1223,14 @@
 
       latest = {
         ok: false,
-        reason: matched ? "write_observed_waiting_for_stability" : (
-          !addressConsistent ? "selected_address_changed_after_write" : "formula_not_matched_after_write"
-        ),
+        reason: matched ? "write_observed_waiting_for_stability" : "formula_not_matched_after_write",
         address: normalizedAddress,
-        observedAddress,
-        addressEvidenceSource: hasExplicitAddress
-          ? addressEvidence.source
-          : "prewrite_selection_continuity",
+        observedAddress: addressEcho,
+        addressEvidenceSource: "feishu_name_box_debug_only",
         context,
         text: observedFormula,
         formulaEditor,
-        selectionVerified: addressConsistent,
+        selectionVerified: Boolean(preWriteObservation && preWriteObservation.selectionVerified),
         stableHits
       };
       checks.push({
@@ -1246,16 +1238,13 @@
         waitMs,
         activeCellAddress,
         addressEcho,
-        observedAddress,
-        addressConsistent,
-        addressEvidenceConflict: addressEvidence.conflict,
+        observedAddress: addressEcho,
         formulaMatches,
         observedFormula,
         stableHits,
-        addressControlTemporarilyUnavailable: !hasExplicitAddress,
+        addressControlTemporarilyUnavailable: !addressEcho,
         activeElement: describeElementForDebug(getDeepActiveElement()),
-        formulaEditor: describeElementForDebug(formulaEditor),
-        sheetCanvas: describeElementForDebug(sheetCanvas)
+        formulaEditor: describeElementForDebug(formulaEditor)
       });
 
       if (stableHits >= 2) {
@@ -1293,7 +1282,7 @@
     let latest = null;
     for (const waitMs of [50, 100, 200, 350, 500]) {
       await sleep(waitMs);
-      const addressEcho = normalizeCellAddress(findCellAddressFromVisibleUi(null));
+      const addressEcho = readVisibleCellAddressEvidence();
       const formulaEditor = findBestFormulaEditor();
       const observedText = normalizeCellText(formulaEditor ? extractEditableText(formulaEditor) : "");
       const sheetCanvas = document.querySelector("canvas.faster-single-canvas");
@@ -1363,16 +1352,7 @@
     const normalizedAddress = normalizeCellAddress(address);
     if (!normalizedAddress) return { ok: false, reason: "invalid_target_address" };
     const navigation = await navigateToCellAddress(normalizedAddress);
-    if (!navigation.ok) {
-      if (navigation.reason === "address_control_not_found" && arguments.length >= 2) {
-        return observeCapturedSelectionContinuity(
-          normalizedAddress,
-          expectedText,
-          navigation
-        );
-      }
-      return navigation;
-    }
+    if (!navigation.ok) return navigation;
     const normalizedExpectedText = arguments.length >= 2
       ? normalizeCellText(expectedText)
       : null;
@@ -1393,16 +1373,15 @@
       const addressControl = findCellAddressControl();
       const sheetCanvas = document.querySelector("canvas.faster-single-canvas");
       const activeCellAddress = normalizeCellAddress(extractCellAddressFromElement(activeCell));
-      const addressEcho = normalizeCellAddress(findCellAddressFromVisibleUi(context));
-      const addressEvidence = resolveAddressEvidence(normalizedAddress, activeCellAddress, addressEcho);
+      const addressEcho = readVisibleCellAddressEvidence(context);
       const formulaEditor = findBestFormulaEditor();
       const text = normalizeCellText(formulaEditor ? extractEditableText(formulaEditor) : "");
       const selectionVisible = Boolean(context || activeCell);
       const sheetCanvasReady = Boolean(sheetCanvas);
       const selectionSurfaceReady = selectionVisible || sheetCanvasReady;
       const formulaReady = Boolean(formulaEditor instanceof Element && isVisibleElement(formulaEditor));
-      const addressVerified = addressEvidence.verified;
-      const addressEvidenceSource = addressEvidence.source;
+      const addressVerified = addressEcho === normalizedAddress;
+      const addressEvidenceSource = addressEcho ? "feishu_name_box" : "unavailable";
       const selectionVerified = Boolean(
         addressVerified &&
         selectionSurfaceReady &&
@@ -1412,7 +1391,7 @@
         ? `${Math.round(context.x)}:${Math.round(context.y)}`
         : "no-context";
       const signature = [
-        addressVerified ? normalizedAddress : addressEvidence.observedAddress,
+        addressVerified ? normalizedAddress : addressEcho,
         text,
         formulaReady ? "formula" : "no-formula"
       ].join("|");
@@ -1424,11 +1403,11 @@
         reason: selectionVerified ? "selection_observed_waiting_for_stability" : "target_selection_unverified",
         address: normalizedAddress,
         requestedAddress: normalizedAddress,
-        observedAddress: addressEvidence.observedAddress,
+        observedAddress: addressEcho,
         activeCellAddress,
         addressEcho,
         addressEvidenceSource,
-        addressEvidenceConflict: addressEvidence.conflict,
+        addressEvidenceConflict: Boolean(addressEcho && addressEcho !== normalizedAddress),
         context,
         text,
         formulaEditor,
@@ -1448,7 +1427,7 @@
         activeCellAddress,
         addressEcho,
         addressEvidenceSource,
-        addressEvidenceConflict: addressEvidence.conflict,
+        addressEvidenceConflict: Boolean(addressEcho && addressEcho !== normalizedAddress),
         selectionVisible,
         sheetCanvasReady,
         selectionSurfaceReady,
@@ -1591,11 +1570,7 @@
       if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) score += 18;
       if (element.getAttribute("role") === "combobox") score += 10;
       if (rect.width <= 140) score += 8;
-      candidates.push({
-        element,
-        score,
-        recognizedBy: addressValue ? "address_value" : "formula_adjacency"
-      });
+      candidates.push({ element, score });
     });
     candidates.sort((a, b) => b.score - a.score);
     return candidates.length ? candidates[0].element : null;
@@ -1647,6 +1622,10 @@
   }
 
   function findCellAddressDisplay() {
+    const exactNameBox = Array.from(document.querySelectorAll(FEISHU_NAME_BOX_SELECTOR))
+      .find((element) => element instanceof Element && isVisibleElement(element));
+    if (exactNameBox instanceof Element) return exactNameBox;
+
     const canvasRect = getSheetCanvasRect(lastCellContext);
     const candidates = [];
     document.querySelectorAll("div,span,button,[aria-label],[title]").forEach((element) => {
@@ -2360,7 +2339,8 @@
         readerKind: "formula_editor",
         reader: describeElementForDebug(editor),
         readerReady,
-        explicitReadOnly: isExplicitReadOnlyFormulaElement(editor)
+        explicitReadOnly: isExplicitReadOnlyFormulaElement(editor),
+        cellAddress: readVisibleCellAddressEvidence()
       }
     };
   }
@@ -2370,220 +2350,160 @@
     return editor ? extractEditableText(editor) : "";
   }
 
-  function probeReadOnlyFormulaBarCapture() {
-    const editableEditor = findVisibleEditableFormulaEditor();
-    if (editableEditor) {
-      return {
-        text: "",
-        cellAccessMode: "unknown",
-        details: { readerKind: "formula_readonly", editableEditorPresent: true }
-      };
-    }
-    const candidate = findBestReadOnlyFormulaReader();
-    return {
-      text: candidate ? candidate.text : "",
-      cellAccessMode: candidate ? "read-only" : "unknown",
-      details: {
-        readerKind: "formula_readonly",
-        reader: describeElementForDebug(candidate && candidate.element),
-        valueBoundary: candidate ? candidate.valueBoundary : "",
-        textFragmentCount: candidate ? candidate.textFragmentCount : 0,
-        explicitReadOnly: Boolean(candidate && candidate.explicitReadOnly),
-        editableEditorPresent: false,
-        score: candidate ? candidate.score : 0
-      }
-    };
-  }
-
   function findVisibleEditableFormulaEditor() {
     const editor = findBestFormulaEditor();
     if (!(editor instanceof Element) || !isVisibleElement(editor)) return null;
     return resolveFormulaElementAccessMode(editor) === "editable" ? editor : null;
   }
 
-  function findBestReadOnlyFormulaReader() {
-    const seen = new Set();
-    const candidates = [];
-    const hosts = collectReadOnlyFormulaHosts();
+  function probeExactFeishuFormulaBarCapture() {
+    const editableEditor = findVisibleEditableFormulaEditor();
+    const selectionValues = Array.from(document.querySelectorAll(FEISHU_SELECTION_VALUE_SELECTOR));
+    const selectionValue = selectionValues
+      .find((element) => element instanceof Element && isVisibleElement(element)) ||
+      selectionValues.find((element) => element instanceof Element) ||
+      null;
+    const formulaBars = Array.from(document.querySelectorAll(FEISHU_FORMULA_BAR_SELECTOR));
+    const formulaBar = formulaBars
+      .find((element) => element instanceof Element && isVisibleElement(element)) ||
+      formulaBars.find((element) => element instanceof Element) ||
+      null;
+    const addressEvidence = readVisibleCellAddressEvidenceDetailed();
+    const cellAddress = addressEvidence.address;
+    const formulaEditor = formulaBar instanceof Element
+      ? resolveFormulaEditable(formulaBar)
+      : null;
 
-    hosts.forEach((host) => {
-      addReadOnlyFormulaCandidate(host, host, seen, candidates);
-      READ_ONLY_FORMULA_VALUE_SELECTORS.forEach((readerSelector) => {
-        host.querySelectorAll(readerSelector).forEach((element) => {
-          addReadOnlyFormulaCandidate(element, host, seen, candidates);
-        });
-      });
-      host.querySelectorAll("span,div,[role='textbox']").forEach((element) => {
-        addReadOnlyFormulaCandidate(element, host, seen, candidates);
-      });
-    });
+    const cellAccessMode = editableEditor
+      ? "editable"
+      : formulaBar instanceof Element || selectionValue instanceof Element
+        ? "read-only"
+        : "unknown";
 
-    candidates.sort(compareReadOnlyFormulaCandidates);
-    return candidates.length ? candidates[0] : null;
-  }
+    if (selectionValue instanceof Element) {
+      const text = extractExactFeishuSelectionText(selectionValue);
+      return {
+        text,
+        cellAccessMode,
+        details: {
+          readerKind: "formula_exact_selection_value",
+          reader: describeElementForDebug(selectionValue),
+          readerReady: true,
+          cellAddress,
+          cellAddressSource: addressEvidence.source,
+          cellAddressReader: describeElementForDebug(addressEvidence.element)
+        }
+      };
+    }
 
-  function collectReadOnlyFormulaHosts() {
-    const hosts = [];
-    const seen = new Set();
-    FORMULA_SELECTORS.forEach((selector) => {
-      document.querySelectorAll(selector).forEach((element) => {
-        if (!(element instanceof Element) || seen.has(element) || !isVisibleElement(element)) return;
-        seen.add(element);
-        hosts.push(element);
-      });
-    });
-    return hosts.filter((host) => !hosts.some((ancestor) => ancestor !== host && ancestor.contains(host)));
-  }
+    if (editableEditor) {
+      const text = extractEditableText(editableEditor);
+      return {
+        text,
+        cellAccessMode: "editable",
+        details: {
+          readerKind: "formula_editor_fallback",
+          reader: describeElementForDebug(editableEditor),
+          readerReady: true,
+          cellAddress,
+          cellAddressSource: addressEvidence.source,
+          cellAddressReader: describeElementForDebug(addressEvidence.element)
+        }
+      };
+    }
 
-  function addReadOnlyFormulaCandidate(element, host, seen, candidates) {
-    if (!(element instanceof Element) || seen.has(element) || !isVisibleElement(element)) return;
-    seen.add(element);
-    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || isContentEditableElement(element)) return;
-    if (element.closest("button,[role='button'],[role='menuitem'],[role='tab']")) return;
+    if (formulaBar instanceof Element) {
+      const text = extractExactFormulaBarText(formulaBar);
+      return {
+        text,
+        cellAccessMode: "read-only",
+        details: {
+          readerKind: "formula_bar_readonly_fallback",
+          reader: describeElementForDebug(formulaEditor || formulaBar),
+          readerReady: true,
+          cellAddress,
+          cellAddressSource: addressEvidence.source,
+          cellAddressReader: describeElementForDebug(addressEvidence.element)
+        }
+      };
+    }
 
-    const content = readReadOnlyFormulaContent(element);
-    const text = content.text;
-    if (!text || !isUsefulText(text) || isFormulaReaderLabel(text) || isLikelyCellAddressToken(text)) return;
-    const explicitReadOnly = isExplicitReadOnlyFormulaElement(element);
-    const valueBoundary = classifyReadOnlyValueBoundary(element, host);
-    if (!valueBoundary && content.textFragmentCount < 2) return;
-    const score = scoreReadOnlyFormulaCandidate(element, host, text, explicitReadOnly, valueBoundary, content.textFragmentCount);
-    if (score < 70) return;
-    candidates.push({
-      element,
-      text,
-      score,
-      explicitReadOnly,
-      valueBoundary,
-      textFragmentCount: content.textFragmentCount
-    });
-  }
-
-  function readReadOnlyFormulaContent(element) {
-    if (!(element instanceof Element)) return { text: "", textFragmentCount: 0 };
-    const valueAttrs = [
-      "data-cell-value",
-      "data-raw-value",
-      "data-value",
-      "data-content",
-      "data-text",
-      "aria-valuetext"
-    ];
-    for (const attr of valueAttrs) {
-      const value = normalizeCellText(element.getAttribute(attr));
-      if (value && value.length <= 50000 && !isFormulaReaderLabel(value)) {
-        return { text: value, textFragmentCount: 1 };
+    return {
+      text: "",
+      cellAccessMode: "unknown",
+      details: {
+        readerKind: "formula_exact",
+        readerReady: false,
+        cellAddress,
+        cellAddressSource: addressEvidence.source,
+        cellAddressReader: describeElementForDebug(addressEvidence.element)
       }
+    };
+  }
+  function extractExactFeishuSelectionText(anchor) {
+    const anchorText = extractExactFormulaBarText(anchor);
+    if (!anchorText.trimStart().startsWith("=")) return anchorText;
+
+    let node = anchor;
+    for (let depth = 0; depth < 6; depth += 1) {
+      const parent = node.parentElement;
+      if (!(parent instanceof Element)) break;
+      const candidate = extractExactFormulaBarText(parent);
+      if (
+        candidate.length > anchorText.length &&
+        candidate.trimStart().startsWith("=")
+      ) {
+        return candidate;
+      }
+      node = parent;
     }
+
+    return anchorText;
+  }
+
+  function readExactFeishuFormulaAddress() {
+    const nameBox = Array.from(document.querySelectorAll(FEISHU_NAME_BOX_SELECTOR))
+      .find((element) => element instanceof Element && isVisibleElement(element));
+    if (!(nameBox instanceof Element)) return "";
+    const valueElement = nameBox instanceof HTMLInputElement || nameBox instanceof HTMLTextAreaElement
+      ? nameBox
+      : nameBox.querySelector("input,textarea,[contenteditable]:not([contenteditable='false'])");
+    const candidates = [
+      valueElement instanceof HTMLInputElement || valueElement instanceof HTMLTextAreaElement ? valueElement.value : "",
+      valueElement instanceof Element ? valueElement.textContent : "",
+      nameBox.textContent || "",
+      nameBox.getAttribute("aria-label") || "",
+      nameBox.getAttribute("title") || ""
+    ];
+    return candidates.map((value) => normalizeExactCellAddress(value)).find(Boolean) || "";
+  }
+
+  function extractExactFormulaBarText(element) {
+    if (!(element instanceof Element)) return "";
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return normalizeElementText(element.value || "");
+    }
+
     const fragments = [];
-    collectReadOnlyValueTextFragments(element, element, fragments);
-    const text = normalizeCellText(fragments.join(""));
-    return text.length <= 50000
-      ? { text, textFragmentCount: fragments.length }
-      : { text: "", textFragmentCount: 0 };
-  }
-
-  function collectReadOnlyValueTextFragments(node, root, fragments) {
-    if (!node) return;
-    if (node.nodeType === 3) {
-      const value = String(node.nodeValue || "");
-      if (value) fragments.push(value);
-      return;
-    }
-    if (node instanceof Element) {
-      if (node !== root && node.matches("button,[role='button'],[role='menuitem'],[role='tab']")) return;
-      if ((node.getAttribute("aria-hidden") || "").toLowerCase() === "true") return;
-    }
-
-    const childNodes = Array.from(node.childNodes || []);
-    if (childNodes.length) {
-      childNodes.forEach((child) => collectReadOnlyValueTextFragments(child, root, fragments));
-      return;
-    }
-
-    if (node instanceof Element) {
-      const fallback = String(node.textContent || "");
-      if (fallback) fragments.push(fallback);
-    }
-  }
-
-  function hasReadOnlyFormulaValueAttribute(element) {
-    return ["data-cell-value", "data-raw-value", "data-value", "data-content", "data-text", "aria-valuetext"]
-      .some((attr) => element.hasAttribute(attr));
-  }
-
-  function classifyReadOnlyValueBoundary(element, host) {
-    const role = (element.getAttribute("role") || "").toLowerCase();
-    if (role === "textbox") return "textbox";
-    if (hasReadOnlyFormulaValueAttribute(element)) return "value_attribute";
-
-    const hint = `${element.className || ""} ${element.id || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
-    const isFormulaValue = /formula[-_\s]?bar|formula.*(?:value|editor|content|input|display|text)|(?:value|editor|content|input|display|text).*formula|fx.*(?:value|editor|content|input|display|text)/.test(hint);
-    if (isFormulaValue) return element === host ? "formula_host" : "formula_value";
-    return "";
-  }
-
-  function compareReadOnlyFormulaCandidates(left, right) {
-    if (readOnlyCandidateDominates(left, right)) return -1;
-    if (readOnlyCandidateDominates(right, left)) return 1;
-
-    const boundaryDifference = readOnlyValueBoundaryRank(right.valueBoundary) - readOnlyValueBoundaryRank(left.valueBoundary);
-    if (boundaryDifference) return boundaryDifference;
-    const fragmentDifference = right.textFragmentCount - left.textFragmentCount;
-    if (fragmentDifference) return fragmentDifference;
-    const scoreDifference = right.score - left.score;
-    if (scoreDifference) return scoreDifference;
-    return right.text.length - left.text.length;
-  }
-
-  function readOnlyCandidateDominates(container, fragment) {
-    if (!container || !fragment || container.element === fragment.element || !container.element.contains(fragment.element)) return false;
-    if (!candidateTextCovers(container, fragment) || container.textFragmentCount <= fragment.textFragmentCount) return false;
-
-    const containerRank = readOnlyValueBoundaryRank(container.valueBoundary);
-    const fragmentRank = readOnlyValueBoundaryRank(fragment.valueBoundary);
-    if (containerRank >= fragmentRank) return true;
-
-    const containerIsFormula = normalizeCellText(container.text).startsWith("=");
-    const fragmentIsFormula = normalizeCellText(fragment.text).startsWith("=");
-    return containerIsFormula && (!fragmentIsFormula || container.textFragmentCount >= fragment.textFragmentCount + 2);
-  }
-
-  function candidateTextCovers(container, fragment) {
-    const containerText = normalizeCellText(container && container.text);
-    const fragmentText = normalizeCellText(fragment && fragment.text);
-    return Boolean(containerText && fragmentText && (containerText === fragmentText || containerText.includes(fragmentText)));
-  }
-
-  function readOnlyValueBoundaryRank(value) {
-    switch (value) {
-      case "value_attribute": return 5;
-      case "textbox": return 4;
-      case "formula_value": return 3;
-      case "formula_host": return 2;
-      default: return 1;
-    }
-  }
-
-  function scoreReadOnlyFormulaCandidate(element, host, text, explicitReadOnly, valueBoundary, textFragmentCount) {
-    let score = 0;
-    const rect = element.getBoundingClientRect();
-    const hint = `${element.className || ""} ${element.id || ""} ${element.getAttribute("role") || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
-    score += readOnlyValueBoundaryRank(valueBoundary) * 35;
-    if (textFragmentCount >= 2) score += 35 + Math.min(120, textFragmentCount * 18);
-    if (explicitReadOnly) score += 20;
-    if (/readonly|read-only|disabled/.test(hint)) score += 12;
-    if (text.startsWith("=")) score += 30;
-    if (element !== host) score += 6;
-    if (rect.top >= 0 && rect.top <= 340) score += 12;
-    if (rect.width >= 120) score += 8;
-    if (text.length >= 4) score += 6;
-    return score;
-  }
-
-  function isFormulaReaderLabel(value) {
-    const text = String(value || "").trim();
-    return /^(?:fx|公式|公式栏|formula|formula bar)$/i.test(text);
+    const visit = (node) => {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        fragments.push(String(node.nodeValue || ""));
+        return;
+      }
+      if (!(node instanceof Element)) return;
+      if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+        fragments.push(String(node.value || ""));
+        return;
+      }
+      if (node.tagName === "BR") {
+        fragments.push("\n");
+        return;
+      }
+      Array.from(node.childNodes || []).forEach(visit);
+    };
+    visit(element);
+    return normalizeElementText(fragments.join(""));
   }
 
   function resolveFormulaElementAccessMode(element) {
@@ -2787,69 +2707,35 @@
     return bestText;
   }
 
-  function evaluateCandidate(text, sourceKey, cellAddress) {
-    if (!text) return { status: "reject", reason: "empty" };
-    if (isBlockedText(text)) return { status: "blocked", reason: "blocked_text" };
-    if (sourceKey && sourceKey.startsWith("formula") && isCurrentCellAddressToken(text, cellAddress)) return { status: "reject", reason: "cell_address_token" };
-    if (!isUsefulText(text)) return { status: "reject", reason: "not_useful" };
-    return { status: "success", reason: "ok" };
+  function evaluateCandidate(sourceKey, readerReady) {
+    if (!readerReady) return { status: "reject", reason: "reader_not_ready" };
+    if (String(sourceKey || "").startsWith("formula")) {
+      const reason = sourceKey === "formula_exact" ? "exact_selection_value" : "formula_reader_ready";
+      return { status: "success", reason };
+    }
+    return { status: "reject", reason: "unsupported_reader" };
   }
 
   function refineFormulaCaptureEvaluation(session, sourceKey, text, evaluation) {
     if (!session || !String(sourceKey || "").startsWith("formula") || !evaluation || evaluation.status !== "success") return evaluation;
 
     const elapsed = elapsedMs(session);
-    if (elapsed < FORMULA_CAPTURE_MIN_ACCEPT_MS) {
+    const minAcceptMs = sourceKey === "formula_exact"
+      ? EXACT_FORMULA_CAPTURE_MIN_ACCEPT_MS
+      : FORMULA_CAPTURE_MIN_ACCEPT_MS;
+    if (elapsed < minAcceptMs) {
       return {
         status: "reject",
         reason: "formula_pending_sync",
         details: {
           elapsedMs: elapsed,
-          minAcceptMs: FORMULA_CAPTURE_MIN_ACCEPT_MS
-        }
-      };
-    }
-
-    if (isLikelyPreviousCellFormulaText(session, text)) {
-      const previousCellAddress = lastCaptureResult && lastCaptureResult.cellAddress ? lastCaptureResult.cellAddress : "";
-      const currentCellAddress = session.cellAddress || "";
-      if (elapsed >= FORMULA_SAME_TEXT_SETTLE_MS) {
-        return {
-          status: "success",
-          reason: "accepted_same_text_after_settle",
-          details: {
-            elapsedMs: elapsed,
-            settleMs: FORMULA_SAME_TEXT_SETTLE_MS,
-            previousCellAddress,
-            currentCellAddress
-          }
-        };
-      }
-
-      session.sawStalePreviousFormula = true;
-      return {
-        status: "reject",
-        reason: "formula_matches_previous_cell",
-        details: {
-          elapsedMs: elapsed,
-          settleMs: FORMULA_SAME_TEXT_SETTLE_MS,
-          previousCellAddress,
-          currentCellAddress
+          minAcceptMs
         }
       };
     }
 
     return evaluation;
   }
-
-  function isLikelyPreviousCellFormulaText(session, text) {
-    if (!lastCaptureResult || !text) return false;
-    if (text !== lastCaptureResult.text) return false;
-    const previousAddress = normalizeCellAddress(lastCaptureResult.cellAddress);
-    const currentAddress = normalizeCellAddress(session && session.cellAddress);
-    return Boolean(previousAddress && currentAddress && previousAddress !== currentAddress);
-  }
-
   function rememberCaptureResult(text, cellAddress, captureMeta) {
     const pageIdentity = readSpreadsheetPageIdentity();
     lastCaptureResult = {
@@ -2906,7 +2792,7 @@
   function extractEditableText(element) {
     if (!(element instanceof Element)) return "";
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      return element.value ? element.value.trim() : "";
+      return normalizeElementText(element.value);
     }
     if (isContentEditableElement(element)) {
       return normalizeElementText(element.textContent || "");
@@ -3878,34 +3764,7 @@
   }
 
   function resolveCellAddress(target, context) {
-    const candidates = [];
-    const add = (element) => {
-      if (!(element instanceof Element) || candidates.includes(element)) return;
-      candidates.push(element);
-      const cell = closestWithinDepth(element, CELL_SELECTOR, MAX_SEARCH_DEPTH);
-      if (cell instanceof Element && !candidates.includes(cell)) candidates.push(cell);
-    };
-
-    add(target);
-
-    const normalizedContext = normalizeCellContext(context);
-    if (normalizedContext) {
-      const pointTarget = document.elementFromPoint(normalizedContext.x, normalizedContext.y);
-      add(pointTarget);
-    }
-
-    add(findCurrentActiveCellElement());
-    add(getDeepActiveElement());
-
-    for (const element of candidates) {
-      const address = extractCellAddressFromElement(element);
-      if (address) return address;
-    }
-
-    const uiAddress = findCellAddressFromVisibleUi(normalizedContext);
-    if (uiAddress) return uiAddress;
-
-    return "";
+    return readVisibleCellAddressEvidence(context);
   }
 
   function extractCellAddressFromElement(element) {
@@ -3982,13 +3841,11 @@
       "[role='combobox']",
       "[aria-label]",
       "[title]",
-      "[class*='formula' i]",
       "[class*='name' i]",
       "[class*='address' i]",
       "[class*='coord' i]",
       "[class*='range' i]",
       "[class*='selection' i]",
-      "[data-testid*='formula' i]",
       "[data-testid*='name' i]",
       "[data-testid*='address' i]",
       "[data-testid*='range' i]",
@@ -4120,9 +3977,22 @@
     const normalized = normalizeCellText(text);
     const cellContext = normalizeCellContext(context) || lastCellContext;
     lastCellContext = cellContext || lastCellContext;
-    const resolvedAddress = resolveCellAddress(null, cellContext);
-    const address = normalizeCellAddress(cellAddress) || resolvedAddress;
+    const captureOrigin = String(captureMeta && captureMeta.captureOrigin || "unspecified");
+    const address = normalizeCellAddress(cellAddress) || resolveCellAddress(null, cellContext);
     const pageIdentity = readSpreadsheetPageIdentity();
+    const targetSnapshot = {
+      text: normalized,
+      address,
+      context: cellContext || null,
+      pageUrl: location.href,
+      sheetId: pageIdentity.sheetId,
+      spreadsheetToken: pageIdentity.spreadsheetToken,
+      fingerprint: buildTargetFingerprint(normalized, address),
+      cellAccessMode: normalizeCellAccessMode(captureMeta && captureMeta.cellAccessMode),
+      selectionConfirmed: Boolean(captureMeta && captureMeta.selectionConfirmed && address),
+      captureOrigin,
+      capturedAt: Number(captureMeta && captureMeta.capturedAt) || Date.now()
+    };
     sendMessage({
       type: "FZ_CELL_SELECTED",
       text: normalized,
@@ -4134,20 +4004,15 @@
       cellAddress: address,
       sheetId: pageIdentity.sheetId,
       spreadsheetToken: pageIdentity.spreadsheetToken,
-      targetSnapshot: {
-        text: normalized,
-        address,
-        context: cellContext || null,
-        pageUrl: location.href,
-        sheetId: pageIdentity.sheetId,
-        spreadsheetToken: pageIdentity.spreadsheetToken,
-        fingerprint: buildTargetFingerprint(normalized, address),
-        cellAccessMode: normalizeCellAccessMode(captureMeta && captureMeta.cellAccessMode),
-        selectionConfirmed: Boolean(captureMeta && captureMeta.selectionConfirmed && address),
-        captureOrigin: String(captureMeta && captureMeta.captureOrigin || "unspecified"),
-        capturedAt: Number(captureMeta && captureMeta.capturedAt) || Date.now()
-      }
+      targetSnapshot
     });
+    return {
+      source,
+      textLength: normalized.length,
+      cellAddress: address,
+      cellContext: cellContext || null,
+      targetSnapshot
+    };
   }
 
   function readSpreadsheetPageIdentity() {
@@ -4208,6 +4073,7 @@
         endedAt: new Date().toISOString(),
         durationMs: Math.max(0, Math.round(performance.now() - session.startedMs)),
         attempts: session.attempts,
+        emittedSelection: session.emittedSelection || null,
         finalResult: { status, chosenSource: chosenSource || "" }
       }
     });
@@ -4249,10 +4115,10 @@
     const attrs = ["data-value", "data-content", "data-text", "data-cell-value", "data-raw-value", "title", "aria-label", "value"];
     for (const attr of attrs) {
       const raw = element.getAttribute(attr);
-      if (raw && raw.trim()) return raw.trim();
+      if (raw != null && raw !== "") return normalizeElementText(raw);
     }
     if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-      if (element.value && element.value.trim()) return element.value.trim();
+      if (element.value !== "") return normalizeElementText(element.value);
     }
     if (isContentEditableElement(element)) {
       const text = normalizeElementText(element.textContent || "");
@@ -4268,7 +4134,6 @@
   function isUsefulText(value) {
     const text = String(value || "").trim();
     if (!text) return false;
-    if (text.length > 50000) return false;
     if (/^(true|false|button|gridcell)$/i.test(text)) return false;
     if (isLikelyUiNoise(text)) return false;
     return true;
@@ -4295,10 +4160,7 @@
   }
 
   function normalizeCellText(value) {
-    let text = String(value || "");
-    text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    text = text.replace(/\n+$/, "").trim();
-    return unquoteSpreadsheetCell(text);
+    return normalizeLineEndings(value);
   }
 
   function normalizeWriteText(value) {
@@ -4343,7 +4205,11 @@
   }
 
   function normalizeElementText(text) {
-    return String(text || "").replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    return normalizeLineEndings(text);
+  }
+
+  function normalizeLineEndings(value) {
+    return String(value == null ? "" : value).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   }
 
   function describeClickTarget(target, event) {

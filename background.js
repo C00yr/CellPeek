@@ -336,13 +336,13 @@ function getSidePanelOpenOptions(tab) {
 }
 
 function resolvePanelCaptureTabId(message) {
+  const directTabId = toFiniteNumber(message && message.tabId);
+  if (typeof directTabId === "number") return directTabId;
+
   const windowId = toFiniteNumber(message && message.windowId);
   if (typeof windowId === "number" && lastFeishuTabIdByWindow.has(windowId)) {
     return lastFeishuTabIdByWindow.get(windowId);
   }
-
-  const directTabId = toFiniteNumber(message && message.tabId);
-  if (typeof directTabId === "number") return directTabId;
 
   return lastFeishuTabId;
 }

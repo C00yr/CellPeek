@@ -1194,9 +1194,23 @@ mark.fz-search-hit.fz-search-hit-current {
   white-space: nowrap;
 }
 
-.fz-relocation-actions .fz-complete-btn {
+.fz-relocation-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.fz-relocation-actions .fz-complete-btn,
+.fz-relocation-actions .fz-discard-btn {
   flex: 0 0 auto;
   min-width: 44px;
+}
+
+.fz-relocation-actions .fz-discard-btn {
+  height: 28px;
+  min-height: 28px;
+  padding: 0 8px;
 }
 
 .fz-type-actions-waiting {

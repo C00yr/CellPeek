@@ -11,8 +11,6 @@
     "FOOTER", "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "LI", "MAIN", "NAV", "OL", "P",
     "PRE", "SECTION", "TABLE", "TBODY", "TD", "TFOOT", "TH", "THEAD", "TR", "UL"
   ]);
-  const TARGET_MISMATCH_MESSAGE = "无法确认原单元格位置，可能因行列调整而发生变化。请重新点击目标单元格后再键入。";
-  const WRITE_CONFLICT_MESSAGE = "原单元格已变化，请重新定位";
   const mathRenderCache = new Map();
   const markdownParser = createMarkdownParser();
   const MODE_LABELS = Object.freeze({ auto: "自动", md: "MD", json: "JSON", raw: "原文" });
@@ -228,7 +226,12 @@
       discardTypingMode(Number(paneElForConfirmDiscard.dataset.pane));
       return;
     }
-
+    if (action === "cancel-relocation") {
+      const paneElForCancelRelocation = actionBtn.closest(".fz-pane");
+      if (!paneElForCancelRelocation) return;
+      cancelRelocationCandidate(Number(paneElForCancelRelocation.dataset.pane));
+      return;
+    }
     if (action === "confirm-relocation") {
       const paneElForRelocation = actionBtn.closest(".fz-pane");
       if (!paneElForRelocation) return;
@@ -1406,6 +1409,7 @@
         reason: log.finalResult && log.finalResult.reason ? log.finalResult.reason : ""
       },
       writePerformance: log.writePerformance && typeof log.writePerformance === "object" ? log.writePerformance : null,
+      emittedSelection: log.emittedSelection && typeof log.emittedSelection === "object" ? log.emittedSelection : null,
       debugType: log.writeRequest ? "write" : "capture"
     };
   }
@@ -1419,15 +1423,14 @@
 
     const payload = JSON.stringify(buildDebugReport(log), null, 2);
     navigator.clipboard.writeText(payload).then(() => {
-      showToast("已复制本次键入调试报告");
+      showToast("已复制本次调试报告");
     }).catch(() => {
       showToast("复制失败，请检查浏览器剪贴板权限");
     });
   }
 
   function getPreferredDebugLog() {
-    const latestWrite = state.debug.logs.find((log) => log && log.debugType === "write");
-    return latestWrite || state.debug.logs[0] || null;
+    return state.debug.logs[0] || null;
   }
 
   function buildDebugReport(log) {
@@ -1437,7 +1440,7 @@
       ? chrome.runtime.getManifest()
       : {};
     return {
-      reportType: "CellPeek write diagnostic",
+      reportType: log && log.debugType === "write" ? "CellPeek write diagnostic" : "CellPeek capture diagnostic",
       reportVersion: 2,
       extensionVersion: manifest.version || "",
       generatedAt: new Date().toISOString(),
@@ -1668,7 +1671,7 @@
         targetSnapshot: message.targetSnapshot || null
       }
     );
-    if (!target.address) return;
+    if (!target.address || !target.selectionConfirmed) return;
     const expectedTarget = pane.editTarget || pane.cellTarget;
     if (expectedTarget && expectedTarget.spreadsheetToken && target.spreadsheetToken &&
       expectedTarget.spreadsheetToken !== target.spreadsheetToken) {
@@ -1798,6 +1801,16 @@
   }
 
 
+  function cancelRelocationCandidate(paneIndex) {
+    const pane = state.panes[paneIndex];
+    if (!pane || !pane.editing || pane.relocationStatus !== "confirming") return;
+    pane.relocationCandidate = null;
+    pane.relocationStatus = "idle";
+    state.activePane = paneIndex;
+    renderChrome();
+    renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
+  }
+
   function confirmRelocationCandidate(paneIndex) {
     const pane = state.panes[paneIndex];
     const candidate = pane && pane.relocationCandidate;
@@ -1815,12 +1828,13 @@
     pane.draftBaseText = candidate.text || "";
     pane.relocationCandidate = null;
     pane.relocationStatus = "idle";
-    completeTypingMode(paneIndex);
+    completeTypingMode(paneIndex, { relocationConfirmed: true });
   }
 
-  async function completeTypingMode(paneIndex) {
+  async function completeTypingMode(paneIndex, options = {}) {
     const pane = state.panes[paneIndex];
     if (!pane || !pane.editing || pane.writing) return;
+    const relocationConfirmed = Boolean(options && options.relocationConfirmed);
     if (normalizeCellAccessMode(pane.editTarget && pane.editTarget.cellAccessMode) === "read-only") {
       showToast("当前写回目标为只读，无法完成键入");
       return;
@@ -1841,12 +1855,7 @@
 
     if (pane.editMode === "json") {
       const jsonDraft = getJsonDraftValidation(pane.draft);
-      if (!jsonDraft.ok) {
-        renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
-        showToast("JSON 无效，请修正后再完成");
-        return;
-      }
-      pane.draft = jsonDraft.formatted;
+      if (jsonDraft.ok) pane.draft = jsonDraft.formatted;
     }
     pane.writing = true;
     renderPane(paneIndex, { preserveScroll: true });
@@ -1873,7 +1882,8 @@
       frameId: pane.editFrameId == null ? null : pane.editFrameId,
       paneIndex,
       clipboardPrimed: shouldPrimeClipboard && Boolean(clipboardPrime.ok),
-      clipboardPrime
+      clipboardPrime,
+      relocationConfirmed
     };
 
     let result;
@@ -1899,47 +1909,16 @@
     if (!response || !response.ok) {
       pane.writing = false;
       const reason = response && response.reason ? response.reason : "UNKNOWN";
-      if ([
-        "TARGET_MISMATCH",
-        "TARGET_NOT_FOUND",
-        "TARGET_ADDRESS_UNAVAILABLE",
-        "TARGET_SELECTION_UNVERIFIED",
-        "FORMULA_EDITOR_NOT_FOUND",
-        "FORMULA_EDITOR_WRITE_FAILED",
-        "FORMULA_EDITOR_COMMIT_FAILED",
-        "WRITE_NOT_PERSISTED"
-      ].includes(reason)) {
+      if (reason === "CONTENT_CHANGED") {
         pane.relocationStatus = "waiting";
         pane.relocationCandidate = null;
         renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
-        showToast(reason === "WRITE_NOT_PERSISTED"
-          ? "未能确认内容已写回，草稿已保留。请重新点击目标单元格定位。"
-          : TARGET_MISMATCH_MESSAGE);
         return;
       }
-      if (reason === "WRITE_CONFLICT") {
-        pane.relocationStatus = "waiting";
-        pane.relocationCandidate = null;
-        renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
-        showToast(WRITE_CONFLICT_MESSAGE);
-        return;
-      }
-      if (reason === "SOURCE_SHEET_UNAVAILABLE") {
-        pane.relocationStatus = "waiting";
-        pane.relocationCandidate = null;
-        renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
-        showToast("无法自动切回来源工作表，请打开来源工作表并点击目标单元格定位。");
-        return;
-      }
-      if (["SOURCE_TAB_UNAVAILABLE", "SOURCE_TAB_NAVIGATED"].includes(reason)) {
-        pane.relocationStatus = "waiting";
-        pane.relocationCandidate = null;
-        renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
-        showToast("原表格标签页已关闭或发生跳转，请重新打开表格并点击目标单元格定位。");
-        return;
-      }
+      pane.relocationStatus = "idle";
+      pane.relocationCandidate = null;
       renderPane(paneIndex, { preserveScroll: true, focusEditor: true });
-      showToast(`写入失败：${reason}`);
+      showToast("写入失败");
       return;
     }
 
@@ -2050,8 +2029,11 @@
   function isRoutedForThisPanel(message) {
     if (!message || !message.fzRouted) return false;
     const messageWindowId = toFiniteNumber(message.windowId);
-    if (!state.scope.windowId || !messageWindowId) return true;
-    return state.scope.windowId === messageWindowId;
+    if (state.scope.windowId && messageWindowId && state.scope.windowId !== messageWindowId) return false;
+    if (message.type === "FZ_PANEL_SCOPE_CHANGED") return true;
+    const messageTabId = toFiniteNumber(message.tabId);
+    if (state.scope.tabId && messageTabId && state.scope.tabId !== messageTabId) return false;
+    return true;
   }
 
   function updatePanelScope(scope) {
@@ -2218,7 +2200,7 @@
       return renderTypingEditor(pane);
     }
 
-    if (!pane.cellTarget || !pane.text) {
+    if (!pane.cellTarget) {
       return '<div class="fz-empty">单击单元格展示内容</div>';
     }
 
@@ -2255,8 +2237,8 @@
 
   function renderTypingStatus(pane) {
     const parts = [];
-    if (pane.relocationStatus === "waiting") {
-      parts.push('<div class="fz-type-status fz-type-status-warning">等待重新定位：请在来源工作表中点击目标单元格</div>');
+    if (["waiting", "confirming"].includes(pane.relocationStatus)) {
+      parts.push('<div class="fz-type-status fz-type-status-warning">单元格内容已发生变化，请在来源工作表中重新点击写入单元格</div>');
     }
     if (pane.editMode === "json") {
       const validation = getJsonDraftValidation(pane.draft);
@@ -2266,13 +2248,15 @@
   }
 
   function renderTypingActions(pane) {
-    const jsonBlocked = pane.editMode === "json" && !getJsonDraftValidation(pane.draft).ok;
     if (pane.confirmDiscard) return "";
     if (pane.relocationStatus === "confirming" && pane.relocationCandidate) {
       return [
         '<div class="fz-type-actions fz-relocation-actions" role="alert">',
-        `<span class="fz-relocation-prompt">写回到 <strong class="fz-relocation-address">${escapeHtml(pane.relocationCandidate.address || "该单元格")}</strong>？</span>`,
-        '<button class="fz-btn fz-complete-btn" data-action="confirm-relocation"${jsonBlocked ? " disabled" : ""}>确认</button>',
+        `<span class="fz-relocation-prompt">是否确认写回到 <strong class="fz-relocation-address">${escapeHtml(pane.relocationCandidate.address || "该单元格")}</strong>？</span>`,
+        '<div class="fz-relocation-buttons">',
+        '<button class="fz-btn fz-discard-btn" data-action="cancel-relocation">取消</button>',
+        '<button class="fz-btn fz-complete-btn" data-action="confirm-relocation">确认</button>',
+        "</div>",
         "</div>"
       ].join("");
     }
@@ -2285,7 +2269,7 @@
     }
     return [
       '<div class="fz-type-actions">',
-      `<button class="fz-btn fz-complete-btn" data-action="complete-typing"${pane.writing || jsonBlocked ? " disabled" : ""}>${pane.writing ? "写入中" : "完成"}</button>`,
+      `<button class="fz-btn fz-complete-btn" data-action="complete-typing"${pane.writing ? " disabled" : ""}>${pane.writing ? "写入中" : "完成"}</button>`,
       `<button class="fz-btn fz-discard-btn" data-action="discard-typing"${pane.writing ? " disabled" : ""}>放弃草稿</button>`,
       "</div>"
     ].join("");
@@ -2867,7 +2851,7 @@
       status.classList.toggle("fz-json-validation-ok", validation.ok);
     }
     const complete = paneEl.querySelector('[data-action="complete-typing"]');
-    if (complete) complete.disabled = Boolean(pane.writing || !validation.ok);
+    if (complete) complete.disabled = Boolean(pane.writing);
     const editor = paneEl.querySelector(".fz-json-type-editor");
     if (editor) syncJsonEditorMirror(editor);
   }
