@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "CellPeek",
+  "name": "CellPeek v 2.0",
   "version": "0.2.0",
   "description": "Preview Feishu/Lark sheet cell content in a right side panel.",
   "icons": {

@@ -1705,6 +1705,9 @@
     if (pane.editing) exitTypingMode(paneIndex);
     pane.writeEchoGuard = null;
     pane.text = text;
+    pane.jsonExpanded = {};
+    pane.jsonModel = null;
+    pane.jsonSearchExpansionSnapshot = null;
     pane.source = source;
     pane.cellContext = normalizePanelCellContext(cellContext);
     pane.cellAddress = normalizeCellAddress(cellAddress);
@@ -2648,11 +2651,10 @@
     return Boolean(node && (node.kind === "object" || node.kind === "array" || node.kind === "embedded"));
   }
 
-  function isJsonNodeExpanded(pane, node, stats) {
+  function isJsonNodeExpanded(pane, node) {
     const key = jsonPathKey(node.path);
     if (Object.prototype.hasOwnProperty.call(pane.jsonExpanded || {}, key)) return Boolean(pane.jsonExpanded[key]);
-    if (node.depth === 0) return true;
-    return stats.totalNodes <= 80 && node.depth <= 2;
+    return true;
   }
 
   function jsonNodeSummary(node) {
@@ -2675,7 +2677,7 @@
     const expanded = expandable ? isJsonNodeExpanded(pane, node, model.stats) : false;
     const pathAttr = encodeJsonPath(node.path);
     const keyHtml = isRoot ? "" : renderJsonNodeKey(node);
-    const copyHtml = isRoot ? "" : `<button class="fz-json-copy" data-action="json-copy-member" data-json-path="${escapeHtml(pathAttr)}" data-tooltip="复制键值对" aria-label="复制 JSON 成员"><svg class="fz-json-copy-icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="2.75" width="7.5" height="8" rx="1.2"></rect><path d="M3.25 5.25v7a1 1 0 0 0 1 1h6"></path></svg></button>`;
+    const copyHtml = isRoot ? "" : `<button class="fz-json-copy" data-action="json-copy-member" data-json-path="${escapeHtml(pathAttr)}" data-tooltip="复制键值对" aria-label="复制 JSON 成员"><svg class="fz-json-copy-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false"><rect x="6.5" y="4.5" width="9" height="9" rx="1.75"></rect><path d="M13.5 13.5v1a1.5 1.5 0 0 1-1.5 1.5H5.5A1.5 1.5 0 0 1 4 14.5V8a1.5 1.5 0 0 1 1.5-1.5h1"></path></svg></button>`;
     const toggleHtml = expandable
       ? `<button class="fz-json-toggle" data-action="json-toggle" data-json-path="${escapeHtml(pathAttr)}" aria-label="${expanded ? "折叠" : "展开"}" aria-expanded="${String(expanded)}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5.5 6 2.5 2.5L10.5 6"></path></svg></button>`
       : '<span class="fz-json-toggle-placeholder" aria-hidden="true"></span>';
@@ -2685,8 +2687,7 @@
       `<div class="fz-json-node fz-json-node-${node.kind}" data-json-path="${escapeHtml(pathAttr)}">`,
       `<div class="fz-json-row" tabindex="-1">`,
       toggleHtml,
-      keyHtml,
-      rowValue,
+      `<span class="fz-json-member">${keyHtml}${keyHtml ? " " : ""}${rowValue}</span>`,
       copyHtml,
       "</div>",
       children,
@@ -2707,7 +2708,7 @@
 
   function renderJsonNodeKey(node) {
     if (node.parentKind === "array") {
-      return `<span class="fz-json-index">[${escapeHtml(node.key)}]</span><span class="fz-json-punctuation">:</span>`;
+      return `<span class="fz-json-index">${escapeHtml(node.key)}</span><span class="fz-json-punctuation">:</span>`;
     }
     if (node.parentKind === "object") {
       return `<span class="fz-json-key">${escapeHtml(JSON.stringify(String(node.key)))}</span><span class="fz-json-punctuation">:</span>`;
@@ -2717,7 +2718,7 @@
 
   function renderJsonNodeValue(node, expanded) {
     if (node.kind === "object" || node.kind === "array") {
-      return `<span class="fz-json-container-value"><span class="fz-json-punctuation">${node.kind === "array" ? "[" : "{"}</span><span class="fz-json-summary">${jsonNodeSummary(node)}</span>${expanded ? "" : `<span class="fz-json-punctuation">${node.kind === "array" ? "]" : "}"}</span>`}</span>`;
+      return `<span class="fz-json-container-value"><span class="fz-json-punctuation">${node.kind === "array" ? "[" : "{"}</span>${expanded ? "" : `${node.children.length ? '<span class="fz-json-summary">…</span>' : ""}<span class="fz-json-punctuation">${node.kind === "array" ? "]" : "}"}</span>`}</span>`;
     }
     if (node.kind === "embedded") {
       return `<span class="fz-json-embedded-value"><span class="fz-json-embedded-badge">JSON 字符串</span><span class="fz-json-summary">${jsonNodeSummary(node)}</span></span>`;

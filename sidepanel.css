@@ -1529,8 +1529,10 @@ mark.fz-search-hit.fz-search-hit-current {
   color: var(--fz-text);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", "Microsoft YaHei UI", monospace;
   font-size: 12.5px;
-  line-height: 1.52;
+  line-height: 1.4;
   white-space: normal;
+  word-break: normal;
+  overflow-x: auto;
 }
 
 .fz-json-node {
@@ -1538,13 +1540,14 @@ mark.fz-search-hit.fz-search-hit-current {
 }
 
 .fz-json-row {
+  position: relative;
   display: flex;
-  min-width: 0;
+  min-width: 200px;
   align-items: flex-start;
-  gap: 4px;
-  padding: 3px 2px;
+  gap: 2px;
+  padding: 1px 2px;
   border-radius: 6px;
-  line-height: 1.52;
+  line-height: 1.4;
   transition: background-color 120ms ease;
 }
 
@@ -1603,6 +1606,9 @@ mark.fz-search-hit.fz-search-hit-current {
 }
 
 .fz-json-copy {
+  position: absolute;
+  top: 1px;
+  right: 2px;
   align-self: flex-start;
   margin-left: auto;
   opacity: 0;
@@ -1615,21 +1621,27 @@ mark.fz-search-hit.fz-search-hit-current {
 }
 
 .fz-json-copy-icon {
-  width: 13px;
-  height: 13px;
+  width: 16px;
+  height: 16px;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.25;
+  stroke-width: 1.65;
 }
 
 .fz-json-key {
-  flex: 0 1 auto;
-  min-width: 0;
   color: #4059ad;
   font-weight: 650;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.fz-json-member {
+  flex: 1;
+  min-width: 0;
+  padding-right: 18px;
 }
 
 .fz-json-index,
@@ -1654,7 +1666,8 @@ mark.fz-search-hit.fz-search-hit-current {
 .fz-json-scalar-string {
   color: #a34f1f;
   white-space: pre-wrap;
-  word-break: break-word;
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 .fz-json-scalar-number {
@@ -1671,13 +1684,13 @@ mark.fz-search-hit.fz-search-hit-current {
 }
 
 .fz-json-children {
-  margin-left: 20px;
-  padding-left: 8px;
+  margin-left: 8px;
+  padding-left: 7px;
   border-left: 1px solid rgba(100, 106, 115, 0.18);
 }
 
 .fz-json-embedded-children {
-  margin-left: 20px;
+  margin-left: 8px;
   border-left-color: rgba(20, 86, 240, 0.2);
 }
 
