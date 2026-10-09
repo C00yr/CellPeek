@@ -2657,14 +2657,6 @@
     return true;
   }
 
-  function jsonNodeSummary(node) {
-    if (!node) return "";
-    if (node.kind === "object") return `{${node.children.length}}`;
-    if (node.kind === "array") return `[${node.children.length}]`;
-    if (node.kind === "embedded" && node.inner) return jsonNodeSummary(node.inner);
-    return "";
-  }
-
   function renderJsonTree(value, pane) {
     const model = buildJsonModel(value);
     pane.jsonModel = model;
@@ -2721,7 +2713,7 @@
       return `<span class="fz-json-container-value"><span class="fz-json-punctuation">${node.kind === "array" ? "[" : "{"}</span>${expanded ? "" : `${node.children.length ? '<span class="fz-json-summary">…</span>' : ""}<span class="fz-json-punctuation">${node.kind === "array" ? "]" : "}"}</span>`}</span>`;
     }
     if (node.kind === "embedded") {
-      return `<span class="fz-json-embedded-value"><span class="fz-json-embedded-badge">JSON 字符串</span><span class="fz-json-summary">${jsonNodeSummary(node)}</span></span>`;
+      return `<span class="fz-json-embedded-value">${expanded ? "" : "…"}</span>`;
     }
     if (node.kind === "truncated") {
       return '<span class="fz-json-truncated">内容过深，未继续展开</span>';
@@ -2864,7 +2856,7 @@
     let changed = false;
     function visit(node, ancestors) {
       if (!node) return;
-      const own = [node.key, node.kind === "embedded" ? "JSON 字符串" : "", node.kind === "string" ? node.value : node.kind === "number" || node.kind === "boolean" ? String(node.value) : ""].join(" ").toLocaleLowerCase();
+      const own = [node.key, node.kind === "string" ? node.value : node.kind === "number" || node.kind === "boolean" ? String(node.value) : ""].join(" ").toLocaleLowerCase();
       if (own.includes(needle)) {
         ancestors.forEach((ancestor) => {
           const key = jsonPathKey(ancestor.path);
