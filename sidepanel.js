@@ -38,6 +38,7 @@
       locked: false,
       mode: "auto",
       text: "",
+      formulaResult: null,
       source,
 
       cellContext: null,
@@ -98,7 +99,19 @@
       ? event.target.closest(".fz-json-type-editor")
       : null;
     if (editor) syncJsonEditorMirror(editor);
+    const formulaEditor = event.target && event.target.closest && event.target.closest(".fz-formula-type-editor");
+    if (formulaEditor) syncFormulaEditorMirror(formulaEditor);
   }, true);
+  for (const eventName of ["select", "keyup", "pointerup", "compositionend"]) {
+    document.addEventListener(eventName, event => {
+      const editor = event.target.closest && event.target.closest(".fz-formula-type-editor");
+      if (editor) syncFormulaEditorMirror(editor);
+    });
+  }
+  document.addEventListener("selectionchange", () => {
+    const editor = document.activeElement;
+    if (editor && editor.matches(".fz-formula-type-editor")) syncFormulaEditorMirror(editor);
+  });
   window.addEventListener("resize", () => {
     hideTooltip();
     renderChrome();
@@ -265,10 +278,10 @@
       return;
     }
 
-    if (action === "copy") {
+    if (action === "copy" || action === "copy-formula") {
       const copyPaneEl = actionBtn.closest(".fz-pane");
       if (!copyPaneEl) return;
-      copyPaneContent(Number(copyPaneEl.dataset.pane));
+      copyPaneContent(Number(copyPaneEl.dataset.pane), action === "copy-formula");
       return;
     }
 
@@ -362,6 +375,7 @@
     pane.draft = editor.value;
     updateTypingCount(paneEl, pane.draft);
     if (pane.editMode === "json") updateJsonTypingUI(paneEl, pane);
+    if (editor.matches(".fz-formula-type-editor")) syncFormulaEditorMirror(editor);
 
   });
 
@@ -715,12 +729,12 @@
     const contentEl = paneEl.querySelector(".fz-content");
     clearSearchHighlights(contentEl);
     const query = String(pane.searchQuery || "");
-    let root = contentEl && contentEl.querySelector(".fz-rendered,.fz-json,.fz-raw");
-    if (root && root.classList.contains("fz-json-tree") && query.trim() && revealJsonSearchMatches(pane, query)) {
+    let root = contentEl && (isFormulaPane(pane) ? contentEl : contentEl.querySelector(".fz-rendered,.fz-json,.fz-raw"));
+    if (contentEl.querySelector(".fz-json-tree") && query.trim() && revealJsonSearchMatches(pane, query)) {
       const scrollTop = contentEl.scrollTop;
       const scrollLeft = contentEl.scrollLeft;
       contentEl.innerHTML = renderPaneContent(pane);
-      root = contentEl.querySelector(".fz-json-tree");
+      root = isFormulaPane(pane) ? contentEl : contentEl.querySelector(".fz-json-tree");
       contentEl.scrollTop = scrollTop;
       contentEl.scrollLeft = scrollLeft;
     }
@@ -800,7 +814,8 @@
       }
 
       const tagName = node.tagName;
-      if (["SCRIPT", "STYLE", "NOSCRIPT", "SVG"].includes(tagName)) return;
+      if (["SCRIPT", "STYLE", "NOSCRIPT", "SVG", "BUTTON"].includes(tagName) ||
+          node.classList.contains("fz-formula-heading") || node.classList.contains("fz-formula-empty")) return;
       if (tagName === "BR") {
         text += "\n";
         return;
@@ -1026,7 +1041,7 @@
       rawLength: 0,
       scrollRatio: Math.max(0, Math.min(1, scrollRatio))
     };
-    if (!pane || !pane.searchOpen || !pane.searchQuery || pane.searchIndex < 0) return anchor;
+    if (!pane || isFormulaPane(pane) || !pane.searchOpen || !pane.searchQuery || pane.searchIndex < 0) return anchor;
 
     const selectedMatch = pane.searchOffsets[pane.searchIndex];
     const visibleOffset = Number.isFinite(selectedMatch)
@@ -1454,11 +1469,21 @@
     };
   }
 
-  async function copyPaneContent(paneIndex) {
+  function isFormulaPane(pane) {
+    return Boolean(pane && String(pane.text || "").trimStart().startsWith("="));
+  }
+
+  function getPaneResultText(pane) {
+    if (!isFormulaPane(pane)) return String(pane.text || "");
+    return pane.formulaResult && pane.formulaResult.status === "ready"
+      ? String(pane.formulaResult.text) : "";
+  }
+
+  async function copyPaneContent(paneIndex, formulaSource = false) {
     const pane = state.panes[paneIndex];
     if (!pane) return;
 
-    const text = pane.editing ? pane.draft : pane.text;
+    const text = pane.editing ? pane.draft : formulaSource ? pane.text : getPaneResultText(pane);
     if (!String(text == null ? "" : text).length) {
       showToast("暂无可复制的展示内容");
       return;
@@ -1603,6 +1628,7 @@
         pageUrl: message.pageUrl || "",
         sheetId: message.sheetId || "",
         cellAccessMode: message.cellAccessMode || "unknown",
+        formulaResult: message.formulaResult || null,
         spreadsheetToken: message.spreadsheetToken || "",
         targetSnapshot: message.targetSnapshot || null
       }
@@ -1705,6 +1731,7 @@
     if (pane.editing) exitTypingMode(paneIndex);
     pane.writeEchoGuard = null;
     pane.text = text;
+    pane.formulaResult = scope && scope.formulaResult || null;
     pane.jsonExpanded = {};
     pane.jsonModel = null;
     pane.jsonSearchExpansionSnapshot = null;
@@ -1738,7 +1765,7 @@
       return;
     }
 
-    const editMode = resolveDisplayKind(pane.text || "", pane.mode);
+    const editMode = isFormulaPane(pane) ? "raw" : resolveDisplayKind(pane.text || "", pane.mode);
     pane.editing = true;
     pane.writing = false;
     pane.editMode = editMode;
@@ -1926,6 +1953,7 @@
     }
 
     pane.text = pane.draft;
+    pane.formulaResult = response.formulaResult || null;
     pane.jsonExpanded = {};
     pane.jsonModel = null;
     pane.jsonSearchExpansionSnapshot = null;
@@ -2181,7 +2209,7 @@
   function updatePaneMeta(paneEl, pane) {
     const addressEl = paneEl.querySelector(".fz-cell-address");
     const countEl = paneEl.querySelector(".fz-cell-count");
-    const displayText = pane.editing ? pane.draft : pane.text;
+    const displayText = pane.editing ? pane.draft : getPaneResultText(pane);
     const countSource = pane.editing ? displayText : normalizeDisplayText(displayText || "");
     if (addressEl) {
       const address = normalizeCellAddress(
@@ -2207,8 +2235,144 @@
       return '<div class="fz-empty">单击单元格展示内容</div>';
     }
 
+    if (isFormulaPane(pane)) return renderFormulaContent(pane);
     return renderContent(pane.text, pane.mode, pane);
   }
+
+  function renderFormulaContent(pane) {
+    const result = pane.formulaResult;
+    const body = result && result.status === "ready"
+      ? result.text === ""
+        ? '<div class="fz-formula-empty" role="status">计算结果为空</div>'
+        : renderContent(result.text, pane.mode, pane)
+      : "";
+    return '<section class="fz-formula-source" aria-label="公式">' +
+      '<div class="fz-formula-heading">公式</div><div class="fz-formula-box">' +
+      '<pre class="fz-raw fz-formula-code">' + highlightFormulaSource(pane.text) + '</pre>' +
+      '<button class="fz-btn fz-formula-copy" data-action="copy-formula" aria-label="复制公式源码" data-tooltip="复制公式">' +
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4H4v12h4"/></svg></button></div></section>' +
+      '<section class="fz-formula-result" aria-label="计算结果"><div class="fz-formula-heading">计算结果</div>' + body + '</section>';
+  }
+  function highlightFormulaSource(value, match) {
+    const source = String(value == null ? "" : value);
+    const references = new Map();
+    const brackets = [];
+    let html = "";
+    let offset = 0;
+    const referencePattern = /^(?:(?:'(?:[^']|'')+'|[\p{L}_][\p{L}\p{N}_.]*)!)?(?:\$?[A-Za-z]+\$?\d+(?::\$?[A-Za-z]+\$?\d+)?|\$?[A-Za-z]+:\$?[A-Za-z]+|\$?\d+:\$?\d+)(?![\p{L}\p{N}_]|\s*\()/u;
+    const append = (text, kind) => {
+      const escaped = escapeHtml(text);
+      const active = match && (offset === match.active || offset === match.partner);
+      const extra = active ? (match.partner < 0 ? " fz-formula-bracket-unmatched" : " fz-formula-bracket-match") : "";
+      html += kind ? `<span class="fz-formula-${kind}${extra}">${escaped}</span>` : escaped;
+      offset += text.length;
+    };
+    while (offset < source.length) {
+      const rest = source.slice(offset);
+      const character = rest[0];
+      if (character === '"') {
+        let end = offset + 1;
+        while (end < source.length) {
+          if (source[end++] !== '"') continue;
+          if (source[end] === '"') { end++; continue; }
+          break;
+        }
+        append(source.slice(offset, end), "string");
+        continue;
+      }
+      const reference = rest.match(referencePattern);
+      if (reference) {
+        const key = reference[0].toLocaleUpperCase();
+        if (!references.has(key)) references.set(key, references.size % 4);
+        append(reference[0], `ref-${references.get(key)}`);
+        continue;
+      }
+      const identifier = rest.match(/^[\p{L}_][\p{L}\p{N}_.]*/u);
+      if (identifier) {
+        const name = identifier[0];
+        const kind = /^\s*\(/.test(rest.slice(name.length)) ? "function"
+          : /^(TRUE|FALSE)$/i.test(name) ? "literal" : "name";
+        append(name, kind);
+        continue;
+      }
+      if ("([{".includes(character)) {
+        const color = brackets.length % 4;
+        brackets.push({ character, color });
+        append(character, `bracket-${color}`);
+        continue;
+      }
+      if (")]}".includes(character)) {
+        const expected = { ")": "(", "]": "[", "}": "{" }[character];
+        const top = brackets[brackets.length - 1];
+        if (top && top.character === expected) {
+          brackets.pop();
+          append(character, `bracket-${top.color}`);
+        } else append(character, "operator");
+        continue;
+      }
+      const number = rest.match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?%?/);
+      if (number) { append(number[0], "number"); continue; }
+      append(character, /[=+\-*/^&<>:,;!]/.test(character) ? "operator" : "");
+    }
+    return html;
+  }
+  function getFormulaBracketMatch(value, caret, selectionEnd = caret) {
+    const source = String(value == null ? "" : value);
+    if (caret !== selectionEnd) return null;
+    const stack = [];
+    const pairs = new Map();
+    const unmatched = new Set();
+    for (let index = 0; index < source.length; index++) {
+      const character = source[index];
+      if (character === '"' || character === "'") {
+        const quote = character;
+        while (++index < source.length) {
+          if (source[index] !== quote) continue;
+          if (source[index + 1] === quote) { index++; continue; }
+          break;
+        }
+        continue;
+      }
+      if ("([{".includes(character)) stack.push(index);
+      else if (")]}".includes(character)) {
+        const opening = stack[stack.length - 1];
+        if (opening != null && source[opening] === { ")": "(", "]": "[", "}": "{" }[character]) {
+          stack.pop();
+          pairs.set(opening, index);
+          pairs.set(index, opening);
+        } else unmatched.add(index);
+      }
+    }
+    stack.forEach(index => unmatched.add(index));
+    const active = [caret - 1, caret].find(index => pairs.has(index) || unmatched.has(index));
+    return active == null ? null : { active, partner: pairs.has(active) ? pairs.get(active) : -1 };
+  }
+
+  function renderFormulaTypeEditor(pane) {
+    const draft = String(pane.draft || "");
+    return '<div class="fz-formula-editor-shell">' +
+      '<pre class="fz-formula-editor-highlight" data-formula-highlight aria-hidden="true">' + highlightFormulaSource(draft) + '</pre>' +
+      '<textarea class="fz-type-editor fz-formula-type-editor" aria-label="编辑公式源码" spellcheck="false" wrap="soft">' + escapeHtml(draft) + '</textarea></div>' +
+      '<div class="fz-formula-bracket-hint" data-formula-bracket-hint role="status" aria-live="polite"></div>';
+  }
+
+  function syncFormulaEditorMirror(editor) {
+    const shell = editor.closest(".fz-formula-editor-shell");
+    const highlight = shell && shell.querySelector("[data-formula-highlight]");
+    if (!highlight) return;
+    const match = getFormulaBracketMatch(editor.value, editor.selectionStart, editor.selectionEnd);
+    highlight.innerHTML = highlightFormulaSource(editor.value, match) + (editor.value.endsWith("\n") ? "\n" : "");
+    highlight.scrollTop = editor.scrollTop;
+    highlight.scrollLeft = editor.scrollLeft;
+    const hint = shell.parentElement.querySelector("[data-formula-bracket-hint]");
+    if (hint) {
+      const text = !match ? "" : match.partner < 0 ? "此括号尚未配对"
+        : `括号配对：第 ${Math.min(match.active, match.partner) + 1} ↔ 第 ${Math.max(match.active, match.partner) + 1} 个字符`;
+      if (hint.textContent !== text) hint.textContent = text;
+      hint.classList.toggle("fz-formula-hint-warning", Boolean(match && match.partner < 0));
+    }
+  }
+
   function renderTypingEditor(pane) {
     const status = renderTypingStatus(pane);
     const confirmDiscard = pane.confirmDiscard
@@ -2225,7 +2389,9 @@
       : "";
     const editor = pane.editMode === "json"
       ? renderJsonTypeEditor(pane)
-      : `<textarea class="fz-type-editor" spellcheck="false">${escapeHtml(pane.draft || "")}</textarea>`;
+      : isFormulaPane(pane)
+        ? renderFormulaTypeEditor(pane)
+        : `<textarea class="fz-type-editor" spellcheck="false">${escapeHtml(pane.draft || "")}</textarea>`;
     return [
       '<div class="fz-type-wrap">',
       '<div class="fz-type-main">',

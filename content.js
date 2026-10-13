@@ -163,6 +163,7 @@
 
     window.setTimeout(() => {
       if (!isSessionActive(session)) return;
+      if (session.formulaReadPending) return;
       if (canEmitStableEmptyCapture(session)) {
         emitStableEmptyCapture(session, "当前空单元格");
         return;
@@ -179,6 +180,7 @@
 
   function runCaptureAttempt(session, target, stepIndex) {
     if (!isSessionActive(session)) return;
+    if (session.formulaReadPending) return;
     if (session.addressEvidenceLocked) {
       updateLockedCaptureAddressEvidence(session, readVisibleCellAddressEvidence(session.clickContext));
     } else if (!session.cellAddress || stepIndex <= 2) {
@@ -243,6 +245,22 @@
 
       session.cellAccessMode = normalizeCellAccessMode(probeResult.cellAccessMode);
       const captureMeta = createCaptureSnapshotMeta(session);
+      if (text.trimStart().startsWith("=")) {
+        session.formulaReadPending = true;
+        readFormulaResult(text, session.cellAddress).then(formulaResult => {
+          if (!isSessionActive(session)) return;
+          if (readVisibleCellAddressEvidence() !== session.cellAddress ||
+              normalizeCellText(probeExactFeishuFormulaBarCapture().text) !== text) {
+            finalizeSession(session, "success", "formula_selection_changed");
+            return;
+          }
+          captureMeta.formulaResult = formulaResult;
+          rememberCaptureResult(text, session.cellAddress, captureMeta);
+          session.emittedSelection = emitCellSelected(text, probe.source, session.clickContext, session.cellAddress, captureMeta);
+          finalizeSession(session, "success", probe.source);
+        });
+        return;
+      }
       rememberCaptureResult(text, session.cellAddress, captureMeta);
       session.emittedSelection = emitCellSelected(
         text,
@@ -722,10 +740,13 @@
     const verifiedContext = normalizeCellContext(verification.context) || context;
     logicalTarget.context = verifiedContext;
     logicalTarget.observation = verification;
-    emitCellSelected(text, "可信选区粘贴写回", verifiedContext, logicalTarget.address);
+    const formulaResult = text.trimStart().startsWith("=")
+      ? await readFormulaResult(text, logicalTarget.address) : null;
+    emitCellSelected(text, "可信选区粘贴写回", verifiedContext, logicalTarget.address, { formulaResult });
     emitWriteDebugSession(debugSession, "success", "verified_selection_paste_ok");
     return buildSuccessfulWriteResponse(message, logicalTarget, {
       debugSessionId: debugSession.id,
+      formulaResult,
       writeStrategy: isClearingCell ? "verified_selection_clear" : "verified_selection_paste"
     });
   }
@@ -3997,6 +4018,7 @@
       type: "FZ_CELL_SELECTED",
       text: normalized,
       source,
+      formulaResult: captureMeta && captureMeta.formulaResult || null,
       pageTitle: document.title,
       pageUrl: location.href,
       cellAccessMode: normalizeCellAccessMode(captureMeta && captureMeta.cellAccessMode),
@@ -4013,6 +4035,26 @@
       cellContext: cellContext || null,
       targetSnapshot
     };
+  }
+
+  function readFormulaResult(formula, address) {
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = result => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result && result.status === "ready" && typeof result.text === "string"
+          ? { status: "ready", text: result.text } : { status: "unavailable" });
+      };
+      const timer = setTimeout(() => finish(null), 1500);
+      try {
+        chrome.runtime.sendMessage({ type: "FZ_READ_FORMULA_RESULT", address, formula }, result => {
+          if (chrome.runtime.lastError) { finish(null); return; }
+          finish(result);
+        });
+      } catch (_) { finish(null); }
+    });
   }
 
   function readSpreadsheetPageIdentity() {

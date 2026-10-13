@@ -79,6 +79,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return;
   if (message.fzRouted) return;
 
+  if (message.type === "FZ_READ_FORMULA_RESULT") {
+    if (!sender.tab || typeof sender.tab.id !== "number") return;
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, frameIds: [sender.frameId || 0] },
+      world: "MAIN",
+      func: (address, formula) => window.__cellPeekReadFormulaResult
+        ? window.__cellPeekReadFormulaResult(address, formula)
+        : { status: "unavailable", reason: "reader_not_installed" },
+      args: [String(message.address || ""), String(message.formula || "")]
+    }).then(results => sendResponse(results[0]?.result || { status: "unavailable" }))
+      .catch(() => sendResponse({ status: "unavailable", reason: "reader_failed" }));
+    return true;
+  }
+
   if (message.type === "FZ_REVEAL_CELL") {
     forwardRevealCell(message).then(sendResponse).catch((error) => {
       sendResponse({ ok: false, reason: error && error.message ? error.message : "REVEAL_FORWARD_FAILED" });
@@ -463,6 +477,11 @@ async function ensureContentScript(tabId, options = {}) {
   if (!options.force && now - lastInjectedAt < INJECT_DEBOUNCE_MS) return true;
 
   try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      files: ["formula-reader.js"]
+    });
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       files: ["content.js"]
